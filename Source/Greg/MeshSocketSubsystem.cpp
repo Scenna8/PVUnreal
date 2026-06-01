@@ -68,17 +68,39 @@ uint32 FSocketListenerThread::Run()
         if (!Client) continue;
 
         // Hand the accepted socket to a thread-pool task immediately so the
-        // accept loop is free to receive the next frame right away.
+        // accept loop is free to receive the next connection right away.
         TQueue<FMeshPayload, EQueueMode::Mpsc>* Q = Queue;
         Async(EAsyncExecution::ThreadPool, [Client, Q]()
         {
+            ISocketSubsystem* SS = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+
+            auto CloseClient = [&]()
+            {
+                Client->Close();
+                SS->DestroySocket(Client);
+            };
+
+            // Send a 4-byte big-endian status code back to Python.
+            // 0 = OK, non-zero = error.  For Update messages this is deferred
+            // until the game thread signals completion via the promise.
+            auto SendAck = [&](int32 Code) -> bool
+            {
+                uint8 Ack[4] = {
+                    uint8((Code >> 24) & 0xFF),
+                    uint8((Code >> 16) & 0xFF),
+                    uint8((Code >>  8) & 0xFF),
+                    uint8( Code        & 0xFF),
+                };
+                int32 Sent = 0;
+                return Client->Send(Ack, 4, Sent) && Sent == 4;
+            };
+
             // ---- 4-byte big-endian length header ----
             uint8 Header[4];
             if (!RecvAll(Client, Header, 4))
             {
                 UE_LOG(LogTemp, Warning, TEXT("MeshSocket: Failed to read header, dropping"));
-                Client->Close();
-                ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(Client);
+                CloseClient();
                 return;
             }
 
@@ -95,97 +117,132 @@ uint32 FSocketListenerThread::Run()
             if (!RecvAll(Client, Buffer.GetData(), MsgLen))
             {
                 UE_LOG(LogTemp, Warning, TEXT("MeshSocket: Incomplete payload, dropping"));
-                Client->Close();
-                ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(Client);
+                CloseClient();
                 return;
             }
             Buffer[MsgLen] = 0;
 
-            Client->Close();
-            ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(Client);
-
             FString JsonStr = FString(UTF8_TO_TCHAR(
                 reinterpret_cast<const char*>(Buffer.GetData())));
 
-            // ---- Parse ----
+            // ---- Parse JSON ----
             TSharedPtr<FJsonObject> JsonObj;
             TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonStr);
             if (!FJsonSerializer::Deserialize(Reader, JsonObj))
             {
                 UE_LOG(LogTemp, Error, TEXT("MeshSocket: JSON parse failed"));
+                SendAck(1);
+                CloseClient();
                 return;
             }
 
-            // ---- Fill payload ----
+            // ---- Dispatch on message type ----
+            const FString TypeStr = JsonObj->HasField(TEXT("type"))
+                ? JsonObj->GetStringField(TEXT("type"))
+                : TEXT("mesh");   // back-compat: no "type" field → treat as mesh
+
             FMeshPayload Payload;
 
-            if (JsonObj->HasField(TEXT("id")))
-                Payload.MeshId = JsonObj->GetStringField(TEXT("id"));
-
-            if (JsonObj->HasField(TEXT("volume_id")))
-                Payload.VolumeId = (int32)JsonObj->GetNumberField(TEXT("volume_id"));
-
-            if (JsonObj->HasField(TEXT("frame")))
-                Payload.FrameIndex = (int32)JsonObj->GetNumberField(TEXT("frame"));
-            if (JsonObj->HasField(TEXT("total_frames")))
-                Payload.TotalFrames = (int32)JsonObj->GetNumberField(TEXT("total_frames"));
-            if (JsonObj->HasField(TEXT("fps")))
-                Payload.PlaybackFPS = (float)JsonObj->GetNumberField(TEXT("fps"));
-
-            for (auto& V : JsonObj->GetArrayField(TEXT("verts")))
+            if (TypeStr == TEXT("bounds"))
             {
-                auto Obj = V->AsObject();
-                Payload.Vertices.Add(FVector(
-                    Obj->GetNumberField(TEXT("X")),
-                    Obj->GetNumberField(TEXT("Y")),
-                    Obj->GetNumberField(TEXT("Z"))));
+                // ---- Bounds: store immediately, ACK on receipt ----
+                Payload.PayloadType = EPayloadType::Bounds;
+
+                auto ParseVec = [&](const FString& Key) -> FVector
+                {
+                    const TSharedPtr<FJsonObject>& Obj = JsonObj->GetObjectField(Key);
+                    return FVector(
+                        Obj->GetNumberField(TEXT("X")),
+                        Obj->GetNumberField(TEXT("Y")),
+                        Obj->GetNumberField(TEXT("Z")));
+                };
+                Payload.BoundsMin = ParseVec(TEXT("min"));
+                Payload.BoundsMax = ParseVec(TEXT("max"));
+
+                UE_LOG(LogTemp, Log, TEXT("MeshSocket: Bounds — min=%s  max=%s"),
+                    *Payload.BoundsMin.ToString(), *Payload.BoundsMax.ToString());
+
+                Q->Enqueue(MoveTemp(Payload));
+                SendAck(0);
+                CloseClient();
             }
-
-            for (auto& T : JsonObj->GetArrayField(TEXT("tris")))
-                Payload.Triangles.Add((int32)T->AsNumber());
-
-            // Scalars and their range — Unreal maps these to UVs and computes normals.
-            if (JsonObj->HasField(TEXT("scalars")))
+            else if (TypeStr == TEXT("update"))
             {
-                for (auto& S : JsonObj->GetArrayField(TEXT("scalars")))
-                    Payload.Scalars.Add((float)S->AsNumber());
-            }
-            if (JsonObj->HasField(TEXT("scalar_min")))
-                Payload.ScalarMin = (float)JsonObj->GetNumberField(TEXT("scalar_min"));
-            if (JsonObj->HasField(TEXT("scalar_max")))
-                Payload.ScalarMax = (float)JsonObj->GetNumberField(TEXT("scalar_max"));
+                // ---- Update: buffer meshes are now committed on the game thread.
+                //              ACK is deferred until the game thread signals done. ----
+                Payload.PayloadType = EPayloadType::Update;
 
-            if (JsonObj->HasField(TEXT("colormap")))
+                // Promise is fulfilled by the game thread after all meshes are built.
+                TSharedPtr<TPromise<int32>> Promise = MakeShared<TPromise<int32>>();
+                TFuture<int32> Future = Promise->GetFuture();
+                Payload.CompletionPromise = Promise;
+
+                UE_LOG(LogTemp, Log, TEXT("MeshSocket: Update received — waiting for game thread"));
+
+                Q->Enqueue(MoveTemp(Payload));
+
+                // Block this thread-pool worker until processing completes.
+                const int32 ResultCode = Future.Get();
+                SendAck(ResultCode);
+                CloseClient();
+            }
+            else
             {
-                auto CmObj = JsonObj->GetObjectField(TEXT("colormap"));
-                Payload.ColorMapWidth  = (int32)CmObj->GetNumberField(TEXT("w"));
-                Payload.ColorMapHeight = (int32)CmObj->GetNumberField(TEXT("h"));
-                for (auto& Px : CmObj->GetArrayField(TEXT("data")))
-                    Payload.ColorMapData.Add((uint8)Px->AsNumber());
+                // ---- Mesh (type == "mesh" or absent): buffer, ACK on receipt ----
+                Payload.PayloadType = EPayloadType::Mesh;
+
+                if (JsonObj->HasField(TEXT("id")))
+                    Payload.MeshId = JsonObj->GetStringField(TEXT("id"));
+                if (JsonObj->HasField(TEXT("volume_id")))
+                    Payload.VolumeId = (int32)JsonObj->GetNumberField(TEXT("volume_id"));
+                if (JsonObj->HasField(TEXT("frame")))
+                    Payload.FrameIndex = (int32)JsonObj->GetNumberField(TEXT("frame"));
+                if (JsonObj->HasField(TEXT("total_frames")))
+                    Payload.TotalFrames = (int32)JsonObj->GetNumberField(TEXT("total_frames"));
+                if (JsonObj->HasField(TEXT("fps")))
+                    Payload.PlaybackFPS = (float)JsonObj->GetNumberField(TEXT("fps"));
+
+                if (JsonObj->HasField(TEXT("verts")))
+                {
+                    for (auto& V : JsonObj->GetArrayField(TEXT("verts")))
+                    {
+                        auto Obj = V->AsObject();
+                        Payload.Vertices.Add(FVector(
+                            Obj->GetNumberField(TEXT("X")),
+                            Obj->GetNumberField(TEXT("Y")),
+                            Obj->GetNumberField(TEXT("Z"))));
+                    }
+                }
+                if (JsonObj->HasField(TEXT("tris")))
+                {
+                    for (auto& T : JsonObj->GetArrayField(TEXT("tris")))
+                        Payload.Triangles.Add((int32)T->AsNumber());
+                }
+                if (JsonObj->HasField(TEXT("scalars")))
+                {
+                    for (auto& S : JsonObj->GetArrayField(TEXT("scalars")))
+                        Payload.Scalars.Add((float)S->AsNumber());
+                }
+                if (JsonObj->HasField(TEXT("scalar_min")))
+                    Payload.ScalarMin = (float)JsonObj->GetNumberField(TEXT("scalar_min"));
+                if (JsonObj->HasField(TEXT("scalar_max")))
+                    Payload.ScalarMax = (float)JsonObj->GetNumberField(TEXT("scalar_max"));
+                if (JsonObj->HasField(TEXT("colormap")))
+                {
+                    auto CmObj = JsonObj->GetObjectField(TEXT("colormap"));
+                    Payload.ColorMapWidth  = (int32)CmObj->GetNumberField(TEXT("w"));
+                    Payload.ColorMapHeight = (int32)CmObj->GetNumberField(TEXT("h"));
+                    for (auto& Px : CmObj->GetArrayField(TEXT("data")))
+                        Payload.ColorMapData.Add((uint8)Px->AsNumber());
+                }
+
+                UE_LOG(LogTemp, Log, TEXT("MeshSocket: Mesh — frame %d, %d verts, %d tris"),
+                    Payload.FrameIndex, Payload.Vertices.Num(), Payload.Triangles.Num());
+
+                Q->Enqueue(MoveTemp(Payload));
+                SendAck(0);
+                CloseClient();
             }
-
-            // Global animation bounds — sent by Python from the raw source data so
-            // Unreal can lock normalization to a consistent transform for all frames.
-            if (JsonObj->HasField(TEXT("anim_bounds_min")) &&
-                JsonObj->HasField(TEXT("anim_bounds_max")))
-            {
-                auto MinObj = JsonObj->GetObjectField(TEXT("anim_bounds_min"));
-                auto MaxObj = JsonObj->GetObjectField(TEXT("anim_bounds_max"));
-                Payload.AnimBoundsMin = FVector(
-                    MinObj->GetNumberField(TEXT("X")),
-                    MinObj->GetNumberField(TEXT("Y")),
-                    MinObj->GetNumberField(TEXT("Z")));
-                Payload.AnimBoundsMax = FVector(
-                    MaxObj->GetNumberField(TEXT("X")),
-                    MaxObj->GetNumberField(TEXT("Y")),
-                    MaxObj->GetNumberField(TEXT("Z")));
-                Payload.bHasAnimBounds = true;
-            }
-
-            UE_LOG(LogTemp, Log, TEXT("MeshSocket: Parsed frame %d — %d verts, %d tris"),
-                Payload.FrameIndex, Payload.Vertices.Num(), Payload.Triangles.Num());
-
-            Q->Enqueue(MoveTemp(Payload));
         });
     }
 

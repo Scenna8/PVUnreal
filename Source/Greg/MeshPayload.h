@@ -1,6 +1,26 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Async/Future.h"
+
+// =============================================================================
+// EPayloadType
+//
+//   Bounds  — sent by BoundingBoxFinder; carries the computational-space BB.
+//             UE stores it immediately and ACKs on receipt.
+//   Mesh    — sent by MeshSender for each frame / static mesh.
+//             UE buffers it and ACKs on receipt.
+//   Update  — sent by MeshSender after all meshes are transmitted.
+//             UE applies the retained BB to every buffered payload, builds all
+//             meshes, then ACKs on completion (not on receipt).
+// =============================================================================
+
+enum class EPayloadType : uint8
+{
+    Mesh,
+    Bounds,
+    Update,
+};
 
 /**
  * FMeshPayload
@@ -18,6 +38,26 @@ struct FMeshPayload
     // =========================================================================
     // Wire data (received from Python)
     // =========================================================================
+
+    /** Distinguishes bounds / mesh / update messages. */
+    EPayloadType PayloadType = EPayloadType::Mesh;
+
+    // ---- Bounds fields (PayloadType == Bounds) ------------------------------
+
+    /** Bounding box of the full computational space in ParaView source units. */
+    FVector BoundsMin = FVector::ZeroVector;
+    FVector BoundsMax = FVector::ZeroVector;
+
+    // ---- Update completion signal (PayloadType == Update) -------------------
+
+    /**
+     * Set by the socket thread before enqueuing an Update payload.
+     * The game thread calls SetValue(0) after all buffered meshes are built,
+     * allowing the socket thread to send the ACK only once processing is done.
+     */
+    TSharedPtr<TPromise<int32>> CompletionPromise;
+
+    // ---- Mesh fields (PayloadType == Mesh) ----------------------------------
 
     /** Routing identifier — matched to a MeshActor key. */
     FString MeshId = TEXT("default");
@@ -57,15 +97,15 @@ struct FMeshPayload
     int32         ColorMapHeight = 0;
 
     /**
-     * Global bounding box of all animation frames in source units (the same
-     * coordinate space as Vertices before normalization).  When present,
-     * AMeshActor uses these instead of frame 0's vertex bounds to compute
-     * NormCenter / NormScale, guaranteeing a consistent normalization transform
-     * — and therefore a stable bounding box — across every frame.
+     * Global bounding box — stamped onto buffered Mesh payloads by
+     * UMeshBuilderSubsystem when the Update message is processed.
+     * Tells AMeshActor the full computational-space extent so it computes a
+     * consistent normalization transform across all frames.
+     * Never transmitted on the wire; always filled in on the game thread.
      */
-    bool    bHasAnimBounds  = false;
-    FVector AnimBoundsMin   = FVector::ZeroVector;
-    FVector AnimBoundsMax   = FVector::ZeroVector;
+    bool    bHasAnimBounds = false;
+    FVector AnimBoundsMin  = FVector::ZeroVector;
+    FVector AnimBoundsMax  = FVector::ZeroVector;
 
     // =========================================================================
     // Computed by AMeshActor (not transmitted)

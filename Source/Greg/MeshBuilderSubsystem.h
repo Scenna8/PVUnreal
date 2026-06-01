@@ -36,6 +36,27 @@ protected:
     virtual void HandlePayload(const FMeshPayload& Payload) override;
 
 private:
+    // ---- Retained computational-space bounding box -------------------------
+
+    /** Set when a Bounds message arrives from BoundingBoxFinder.
+     *  Stamped onto every buffered mesh payload at Update time so all frames
+     *  share one consistent normalization transform. */
+    FVector RetainedBoundsMin  = FVector::ZeroVector;
+    FVector RetainedBoundsMax  = FVector::ZeroVector;
+    bool    bHasRetainedBounds = false;
+
+    // ---- Pending mesh buffer -----------------------------------------------
+
+    /** Accumulates Mesh payloads until an Update message triggers commit.
+     *  All items are processed (and the buffer cleared) in HandlePayload when
+     *  PayloadType == Update, after which the Update's CompletionPromise is
+     *  fulfilled so the socket thread can send the deferred ACK to Python. */
+    TArray<FMeshPayload> PendingMeshPayloads;
+
+    /** Processes one mesh payload — spawns / updates mesh actors.
+     *  Called for each item in PendingMeshPayloads during Update handling. */
+    void ProcessMeshPayload(const FMeshPayload& Payload);
+
     // ---- Mesh actors -------------------------------------------------------
 
     UPROPERTY()

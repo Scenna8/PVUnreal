@@ -213,6 +213,54 @@ bool UMeshBuilderSubsystem::RefreshVolumeList(float /*DeltaTime*/)
 
 void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
 {
+    // ---- Bounds: store and return immediately ----
+    if (Payload.PayloadType == EPayloadType::Bounds)
+    {
+        RetainedBoundsMin  = Payload.BoundsMin;
+        RetainedBoundsMax  = Payload.BoundsMax;
+        bHasRetainedBounds = true;
+        UE_LOG(LogTemp, Warning,
+            TEXT("MeshBuilder: Retained bounds — min=%s  max=%s"),
+            *RetainedBoundsMin.ToString(), *RetainedBoundsMax.ToString());
+        return;
+    }
+
+    // ---- Mesh: buffer and return immediately ----
+    if (Payload.PayloadType == EPayloadType::Mesh)
+    {
+        PendingMeshPayloads.Add(Payload);
+        UE_LOG(LogTemp, Log,
+            TEXT("MeshBuilder: Buffered mesh payload (frame %d) — %d pending"),
+            Payload.FrameIndex, PendingMeshPayloads.Num());
+        return;
+    }
+
+    // ---- Update: stamp bounds, process all buffered payloads, signal done ----
+    // (PayloadType == EPayloadType::Update)
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("MeshBuilder: Update — committing %d buffered payload(s)"),
+        PendingMeshPayloads.Num());
+
+    for (FMeshPayload& P : PendingMeshPayloads)
+    {
+        if (bHasRetainedBounds)
+        {
+            P.bHasAnimBounds = true;
+            P.AnimBoundsMin  = RetainedBoundsMin;
+            P.AnimBoundsMax  = RetainedBoundsMax;
+        }
+        ProcessMeshPayload(P);
+    }
+    PendingMeshPayloads.Empty();
+
+    // Signal the socket thread that processing is complete so it can send the ACK.
+    if (Payload.CompletionPromise.IsValid())
+        Payload.CompletionPromise->SetValue(0);
+}
+
+void UMeshBuilderSubsystem::ProcessMeshPayload(const FMeshPayload& Payload)
+{
     UWorld* World = GetGameInstance()->GetWorld();
     if (!World)
     {
@@ -314,7 +362,7 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
     else
     {
         UE_LOG(LogTemp, Log,
-            TEXT("MeshBuilder: Buffered frame %d for '%s' → '%s'  %d instance(s)"),
+            TEXT("MeshBuilder: Committed frame %d for '%s' → '%s'  %d instance(s)"),
             Payload.FrameIndex, *Id, *VolumeName, Transforms.Num());
     }
 

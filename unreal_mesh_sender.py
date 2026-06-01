@@ -5,30 +5,49 @@ unreal_mesh_sender.py — ParaView plugin
 Two filters under Filters → Unreal Engine:
 
   1. Bounding Box Finder
-     Apply this to any dataset to capture its spatial bounds.  Connect its
-     output to the "Bounding Box" port of the Mesh Sender so the animation
-     uses a fixed, consistent normalization transform across every frame.
+     Apply this to any dataset to send its spatial bounds to Unreal Engine
+     immediately.  UE retains those bounds and uses them when building meshes
+     so that every frame shares one consistent normalization transform.
+
+     Place this filter directly after your data source (importer) so that the
+     full computational-space bounds are known before any mesh data is sent.
 
   2. Mesh Sender
      Sends the active dataset (static or animated) to a running Unreal Engine
-     instance over TCP.  Optionally accepts a Bounding Box Finder output on
-     its second input port to lock the bounding box during animation playback.
+     instance over TCP.  Each mesh or frame is buffered by UE on receipt.
+     After all meshes are sent, a final Update message tells UE to commit:
+     it stamps the retained BB onto every buffered payload, computes the
+     ParaView-BB → UE-display-box transform, and builds the mesh actors.
+
+Protocol (all messages on port 9000)
+-------------------------------------
+  Every message is length-prefixed JSON:
+    [4-byte big-endian length][UTF-8 JSON]
+  Every message receives a 4-byte big-endian ACK from UE before the
+  connection closes:
+    bounds / mesh  → ACK on receipt
+    update         → ACK after all meshes are built (deferred)
+
+  Message types:
+    {"type": "bounds", "min": {X,Y,Z}, "max": {X,Y,Z}}
+    {"type": "mesh",   "id": ..., "verts": [...], "tris": [...], ...}
+    {"type": "update"}
 
 Install
 -------
     Tools → Manage Plugins → Load New → select this file
     Tick "Auto Load" to load it automatically on startup.
 
-Typical animation workflow
---------------------------
-    1. Load your animation source in ParaView.
-    2. Add Filters → Unreal Engine → Bounding Box Finder to it.
-       Apply — note the printed bounds in the Output Messages panel.
-    3. Select your original animation source again.
-    4. Add Filters → Unreal Engine → Mesh Sender.
-       In the Properties panel, connect the Bounding Box Finder output to
-       the "Bounding Box" input port.
-    5. Set Scalar Field, Mesh ID, etc., then click Apply.
+Typical workflow
+-----------------
+    1. Load your data source in ParaView.
+    2. Add Filters → Unreal Engine → Bounding Box Finder to it.  Apply.
+       UE immediately stores the computational-space bounds.
+    3. Select your original source again.
+    4. Add Filters → Unreal Engine → Mesh Sender.  Set Scalar Field,
+       Mesh ID, etc., then click Apply.
+       Meshes are buffered by UE; when all are sent an Update is issued
+       and UE builds the final mesh actors.
 
 Requirements
 ------------
@@ -219,21 +238,56 @@ def _query_volume_names(host, port=9001):
     return ['Volume 1']
 
 
+def _send_message(payload, host="127.0.0.1", port=9000, timeout=60):
+    """
+    Send a length-prefixed JSON message to Unreal and wait for the 4-byte ACK.
+
+    Protocol:
+      → [4-byte big-endian payload length][UTF-8 JSON]
+      ← [4-byte big-endian status code]   (0 = OK)
+
+    Raises OSError on connection failure and RuntimeError on a non-zero ACK.
+    The Update message uses a longer timeout because UE defers the ACK until
+    all mesh actors are built.
+    """
+    data   = json.dumps(payload).encode("utf-8")
+    header = struct.pack(">I", len(data))
+    with socket.create_connection((host, port), timeout=10) as sock:
+        sock.sendall(header + data)
+        # Wait up to `timeout` seconds for the ACK (Update can take a while).
+        sock.settimeout(timeout)
+        ack_bytes = b""
+        while len(ack_bytes) < 4:
+            chunk = sock.recv(4 - len(ack_bytes))
+            if not chunk:
+                raise OSError("Connection closed before ACK was received")
+            ack_bytes += chunk
+    code = struct.unpack(">I", ack_bytes)[0]
+    if code != 0:
+        raise RuntimeError(f"UE returned error ACK {code} for message type '{payload.get('type', '?')}'")
+
+
+def _send_bounds(bounds_min, bounds_max, host="127.0.0.1", port=9000):
+    """Send a bounds message and wait for the ACK."""
+    _send_message({
+        "type": "bounds",
+        "min": {"X": float(bounds_min[0]), "Y": float(bounds_min[1]), "Z": float(bounds_min[2])},
+        "max": {"X": float(bounds_max[0]), "Y": float(bounds_max[1]), "Z": float(bounds_max[2])},
+    }, host=host, port=port)
+
+
 def _send_mesh(vertices, triangles,
                scalars=None, scalar_min=None, scalar_max=None,
                color_map=None, mesh_id=None, volume_id=None,
                frame_index=None, total_frames=None, playback_fps=None,
-               anim_bounds_min=None, anim_bounds_max=None,
                host="127.0.0.1", port=9000):
     """
-    Send a length-prefixed JSON payload to Unreal.
-    Protocol: 4-byte big-endian length header followed by UTF-8 JSON.
-
-    anim_bounds_min / anim_bounds_max: optional (x, y, z) giving the global
-    bounding box in source units.  Unreal uses these to derive one consistent
-    normalization transform across all animation frames.
+    Send a mesh message and wait for the ACK (ACKed on receipt, not on build).
+    Bounds are no longer included here — they are sent separately by
+    BoundingBoxFinder via _send_bounds() before any mesh messages.
     """
     payload = {
+        "type": "mesh",
         "verts": [{"X": v[0], "Y": v[1], "Z": v[2]} for v in vertices],
         "tris":  triangles,
     }
@@ -253,23 +307,17 @@ def _send_mesh(vertices, triangles,
         payload["scalar_max"] = scalar_max if scalar_max is not None else float(max(scalars))
     if color_map:
         payload["colormap"] = color_map
-    if anim_bounds_min is not None:
-        payload["anim_bounds_min"] = {
-            "X": float(anim_bounds_min[0]),
-            "Y": float(anim_bounds_min[1]),
-            "Z": float(anim_bounds_min[2]),
-        }
-    if anim_bounds_max is not None:
-        payload["anim_bounds_max"] = {
-            "X": float(anim_bounds_max[0]),
-            "Y": float(anim_bounds_max[1]),
-            "Z": float(anim_bounds_max[2]),
-        }
 
-    data   = json.dumps(payload).encode("utf-8")
-    header = struct.pack(">I", len(data))
-    with socket.create_connection((host, port), timeout=10) as sock:
-        sock.sendall(header + data)
+    _send_message(payload, host=host, port=port)
+
+
+def _send_update(host="127.0.0.1", port=9000):
+    """
+    Send the Update message and wait for the deferred ACK.
+    UE sends the ACK only after all buffered meshes have been built, so this
+    call may block for several seconds on large datasets — the timeout is 120 s.
+    """
+    _send_message({"type": "update"}, host=host, port=port, timeout=120)
 
 
 # =============================================================================
@@ -308,6 +356,25 @@ class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
         VTKPythonAlgorithmBase.__init__(
             self, nInputPorts=1, nOutputPorts=1, outputType="vtkDataSet"
         )
+        self._host = "127.0.0.1"
+        self._port = 9000
+
+    @smproperty.stringvector(name="Host", label="Unreal Host",
+                              default_values="127.0.0.1")
+    def SetHost(self, v):
+        self._host = v or "127.0.0.1"
+        self.Modified()
+
+    def GetHost(self):
+        return self._host
+
+    @smproperty.intvector(name="Port", label="Port", default_values=[9000])
+    def SetPort(self, v):
+        self._port = int(v)
+        self.Modified()
+
+    def GetPort(self):
+        return self._port
 
     def FillOutputPortInformation(self, port, info):
         info.Set(vtk.vtkDataObject.DATA_TYPE_NAME(), "vtkDataObject")
@@ -336,12 +403,20 @@ class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
 
         if inp_ds is not None:
             b = inp_ds.GetBounds()   # (xmin, xmax, ymin, ymax, zmin, zmax)
-            _bounds_store['min'] = (b[0], b[2], b[4])
-            _bounds_store['max'] = (b[1], b[3], b[5])
-            print("[BoundingBoxFinder] Bounds stored — Mesh Sender will pick these up:")
+            bmin = (b[0], b[2], b[4])
+            bmax = (b[1], b[3], b[5])
+            # Keep the shared store for any legacy callers.
+            _bounds_store['min'] = bmin
+            _bounds_store['max'] = bmax
+            print("[BoundingBoxFinder] Bounds computed:")
             print(f"  X: [{b[0]:.6g}, {b[1]:.6g}]")
             print(f"  Y: [{b[2]:.6g}, {b[3]:.6g}]")
             print(f"  Z: [{b[4]:.6g}, {b[5]:.6g}]")
+            try:
+                _send_bounds(bmin, bmax, host=self._host, port=self._port)
+                print(f"[BoundingBoxFinder] Bounds sent to UE ({self._host}:{self._port}) — ACK received")
+            except Exception as e:
+                print(f"[BoundingBoxFinder] WARNING: Could not send bounds to UE: {e}")
         else:
             print("[BoundingBoxFinder] WARNING: Input is not a vtkDataSet — "
                   "cannot read bounds. Try applying to a vtu/vtp source directly.")
@@ -611,18 +686,11 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         print(f"[MeshSender] Input: {inp.GetClassName()}, "
               f"{inp.GetNumberOfPoints()} pts, {inp.GetNumberOfCells()} cells")
 
-        # --- Pick up bounds from BoundingBoxFinder (shared module variable) ---
-        if _bounds_store['min'] is not None:
-            anim_bounds_min = _bounds_store['min']
-            anim_bounds_max = _bounds_store['max']
-            print(f"[MeshSender] Using captured bounds: "
-                  f"min={anim_bounds_min}  max={anim_bounds_max}")
-
-        else:
-            anim_bounds_min = None
-            anim_bounds_max = None
-            print("[MeshSender] No bounds captured — "
-                  "apply Bounding Box Finder first to lock the animation bounding box")
+        # Bounds are now sent directly by BoundingBoxFinder to UE.
+        # Log a reminder if the shared store is empty (BB filter not applied).
+        if _bounds_store['min'] is None:
+            print("[MeshSender] NOTE: No bounds in shared store — "
+                  "ensure Bounding Box Finder has been applied and sent bounds to UE")
 
         # --- Detect animation ---
         info_obj   = inInfo[0].GetInformationObject(0)
@@ -656,7 +724,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             if is_anim:
                 self._animation_frames[frame_idx] = None
                 if len(self._animation_frames) == n_steps:
-                    self._send_buffered_animation(n_steps, anim_bounds_min, anim_bounds_max)
+                    self._send_buffered_animation(n_steps)
             return 1
 
         out.ShallowCopy(poly)
@@ -683,14 +751,12 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                 'tris':    tris,
                 'scalars': scalar_values,
                 'chosen':  chosen,
-                'bounds_min': anim_bounds_min,
-                'bounds_max': anim_bounds_max,
             }
             print(f"[MeshSender] Buffered frame {frame_idx} "
                   f"({len(self._animation_frames)}/{n_steps})")
 
             if len(self._animation_frames) == n_steps:
-                self._send_buffered_animation(n_steps, anim_bounds_min, anim_bounds_max)
+                self._send_buffered_animation(n_steps)
         else:
             if scalar_values is not None:
                 cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
@@ -726,8 +792,10 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                            scalars=scalars_list, scalar_min=vmin, scalar_max=vmax,
                            color_map=cmap, mesh_id=mesh_id, volume_id=volume_id,
                            host=self._host, port=self._port)
-                print(f"[MeshSender] SUCCESS — {len(verts)} verts, "
-                      f"{len(tris)//3} tris sent")
+                print(f"[MeshSender] Mesh buffered by UE — sending Update ...")
+                _send_update(host=self._host, port=self._port)
+                print(f"[MeshSender] SUCCESS — Update ACK received "
+                      f"({len(verts)} verts, {len(tris)//3} tris)")
             except OSError as e:
                 print(f"[MeshSender] ERROR: Connection failed — {e}")
             except Exception as e:
@@ -735,13 +803,12 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         return 1
 
-    def _send_buffered_animation(self, total_frames, anim_bounds_min, anim_bounds_max):
+    def _send_buffered_animation(self, total_frames):
         """
-        Called once all animation frames have been buffered.
-        Computes a global scalar range, then sends each frame as an indexed
-        animation packet.  Passes anim_bounds_min/max (from the Bounding Box
-        Finder) so Unreal can lock the normalization transform for the whole
-        sequence.
+        Called once all animation frames have been collected locally.
+        Sends each frame as a mesh message (ACKed on receipt), then sends
+        a single Update message and waits for the deferred ACK that confirms
+        UE has stamped the retained BB and built all mesh actors.
         """
         print(f"[MeshSender] All {total_frames} frames collected — sending ...")
 
@@ -764,11 +831,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             g_min = g_max = 0.0
             cmap = None
 
-        if anim_bounds_min is not None:
-            print(f"[MeshSender] Bounds: min={anim_bounds_min}  max={anim_bounds_max}")
-        else:
-            print("[MeshSender] No bounding box — Unreal will normalise per frame 0")
-
         n_valid = len(valid_frames)
         print(f"[MeshSender] Sending {n_valid} frames  "
               f"mesh='{mesh_id or 'default'}'  fps={fps:.1f}")
@@ -778,23 +840,24 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                 scalars = frame.get('scalars')
                 _send_mesh(
                     frame['verts'], frame['tris'],
-                    scalars       = scalars.tolist() if scalars is not None else None,
-                    scalar_min    = g_min,
-                    scalar_max    = g_max,
-                    color_map     = (cmap if seq_idx == 0 else None),
-                    mesh_id       = mesh_id,
-                    volume_id     = volume_id,
-                    frame_index   = seq_idx,
-                    total_frames  = n_valid,
-                    playback_fps  = fps,
-                    anim_bounds_min = anim_bounds_min,
-                    anim_bounds_max = anim_bounds_max,
-                    host = self._host,
-                    port = self._port,
+                    scalars      = scalars.tolist() if scalars is not None else None,
+                    scalar_min   = g_min,
+                    scalar_max   = g_max,
+                    color_map    = (cmap if seq_idx == 0 else None),
+                    mesh_id      = mesh_id,
+                    volume_id    = volume_id,
+                    frame_index  = seq_idx,
+                    total_frames = n_valid,
+                    playback_fps = fps,
+                    host         = self._host,
+                    port         = self._port,
                 )
-                print(f"[MeshSender]   frame {seq_idx + 1}/{n_valid} sent")
+                print(f"[MeshSender]   frame {seq_idx + 1}/{n_valid} buffered by UE")
 
-            print(f"[MeshSender] Animation complete → {self._host}:{self._port}")
+            print(f"[MeshSender] All frames buffered — sending Update ...")
+            _send_update(host=self._host, port=self._port)
+            print(f"[MeshSender] Animation complete — Update ACK received "
+                  f"→ {self._host}:{self._port}")
         except OSError as e:
             print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
