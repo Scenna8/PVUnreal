@@ -106,10 +106,10 @@ private:
     FVector TargetHalfExtents = FVector(100.f);
 
     /**
-     * Center and uniform-scale transform locked to a specific frame.
-     * For static meshes this is recomputed on every ApplyMesh call.
-     * For animations it is locked to frame 0 and reused for all subsequent
-     * frames so the mesh doesn't jump or rescale between frames.
+     * Center and uniform-scale transform derived from the computational-space
+     * bounding box sent by BoundingBoxFinder.  Locked once per mesh/sequence
+     * and reused for every frame so the transform is stable regardless of how
+     * the mesh geometry changes.
      */
     bool    bNormLocked = false;
     FVector NormCenter  = FVector::ZeroVector;
@@ -125,9 +125,6 @@ private:
     bool    bHasFixedBounds   = false;
     FVector FixedBoundsMin    = FVector::ZeroVector;
     FVector FixedBoundsMax    = FVector::ZeroVector;
-
-    /** Compute NormCenter / NormScale from Vertices and set bNormLocked. */
-    void LockNormalization(const TArray<FVector>& Vertices);
 
     /**
      * Compute NormCenter / NormScale from an explicit global bounding box

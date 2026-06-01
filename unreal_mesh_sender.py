@@ -71,6 +71,7 @@ import numpy as np
 import socket
 import struct
 import json
+import threading
 
 
 # =============================================================================
@@ -431,7 +432,7 @@ class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
 # =============================================================================
 
 @smproxy.filter(name="UnrealMeshSender", label="Mesh Sender")
-@smhint.xml('<ShowInMenu category="Unreal Engine"/><AutoApply frequency="1"/>')
+@smhint.xml('<ShowInMenu category="Unreal Engine"/>')
 @smproperty.input(name="Input", port_index=0)
 @smdomain.datatype(dataTypes=["vtkDataSet"])
 class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
@@ -462,6 +463,8 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         self._ctf_observer_tag     = None
         self._updating_ctf         = False
         self._my_proxy             = None
+        self._send_thread          = None
+        self._cancel_flag          = threading.Event()
 
     # ------------------------------------------------------------------ helpers
 
@@ -638,6 +641,28 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     def GetPlaybackFPS(self):
         return self._playback_fps
 
+    @smproperty.xml("""
+        <IntVectorProperty name="CancelSend" label="Cancel Send"
+            command="SetCancelSend"
+            number_of_elements="1"
+            default_values="0"
+            animateable="0">
+            <BooleanDomain name="bool"/>
+            <Documentation>
+                Set to cancel an in-progress animation send.
+                The current frame finishes (waiting for its ACK), then the
+                send loop exits cleanly.
+            </Documentation>
+        </IntVectorProperty>
+    """)
+    def SetCancelSend(self, v):
+        if v:
+            self._cancel_flag.set()
+            print("[MeshSender] Cancel requested — will stop after current frame")
+
+    def GetCancelSend(self):
+        return 0   # always reads back as unchecked
+
     @smproperty.stringvector(name="Host", label="Unreal Host",
                               default_values="127.0.0.1")
     def SetHost(self, v):
@@ -704,6 +729,13 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                             key=lambda i: abs(time_steps[i] - (cur_time or 0.0)))
             print(f"[MeshSender] Animation — frame {frame_idx + 1}/{n_steps} "
                   f"(t={cur_time:.4g})")
+            # Disconnect the CTF observer — it calls UpdatePipeline() on every
+            # colormap change, which keeps driving the pipeline even after the
+            # ParaView Stop button is clicked.  It's only needed for static meshes.
+            if self._observed_ctf is not None:
+                self._observed_ctf.RemoveObserver(self._ctf_observer_tag)
+                self._observed_ctf    = None
+                self._ctf_observer_tag = None
         else:
             frame_idx = -1
             print("[MeshSender] Static")
@@ -724,7 +756,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             if is_anim:
                 self._animation_frames[frame_idx] = None
                 if len(self._animation_frames) == n_steps:
-                    self._send_buffered_animation(n_steps)
+                    self._launch_send_thread(n_steps)
             return 1
 
         out.ShallowCopy(poly)
@@ -756,7 +788,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                   f"({len(self._animation_frames)}/{n_steps})")
 
             if len(self._animation_frames) == n_steps:
-                self._send_buffered_animation(n_steps)
+                self._launch_send_thread(n_steps)
         else:
             if scalar_values is not None:
                 cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
@@ -803,22 +835,43 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         return 1
 
-    def _send_buffered_animation(self, total_frames):
+    def _launch_send_thread(self, total_frames):
         """
-        Called once all animation frames have been collected locally.
-        Sends each frame as a mesh message (ACKed on receipt), then sends
-        a single Update message and waits for the deferred ACK that confirms
-        UE has stamped the retained BB and built all mesh actors.
+        Cancel any in-progress send, then start a new daemon thread to send
+        all buffered frames.  Returns immediately so ParaView's pipeline thread
+        (and the GUI) stays responsive.
         """
-        print(f"[MeshSender] All {total_frames} frames collected — sending ...")
+        if self._send_thread and self._send_thread.is_alive():
+            print("[MeshSender] Previous send still running — cancelling it first")
+            self._cancel_flag.set()
+            self._send_thread.join(timeout=5)
+
+        frames_snapshot = dict(self._animation_frames)
+        self._animation_frames = {}
+
+        self._send_thread = threading.Thread(
+            target=self._send_buffered_animation,
+            args=(total_frames, frames_snapshot),
+            daemon=True,
+        )
+        self._send_thread.start()
+        print(f"[MeshSender] Send thread started for {total_frames} frames")
+
+    def _send_buffered_animation(self, total_frames, frames_snapshot):
+        """
+        Runs on a daemon thread.  Sends each frame as a mesh message (ACKed on
+        receipt), checks the cancel flag between frames, then sends a single
+        Update message and waits for the deferred ACK from UE.
+        """
+        self._cancel_flag.clear()
 
         mesh_id   = self._mesh_id.strip() or None
         volume_id = self._volume_index
         fps       = self._playback_fps
 
-        valid_frames = [(i, self._animation_frames[i])
+        valid_frames = [(i, frames_snapshot[i])
                         for i in range(total_frames)
-                        if self._animation_frames.get(i) is not None]
+                        if frames_snapshot.get(i) is not None]
         all_scalars = [f['scalars'] for _, f in valid_frames
                        if f.get('scalars') is not None]
 
@@ -837,6 +890,10 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         try:
             for seq_idx, (_, frame) in enumerate(valid_frames):
+                if self._cancel_flag.is_set():
+                    print(f"[MeshSender] Cancelled after {seq_idx}/{n_valid} frames")
+                    return
+
                 scalars = frame.get('scalars')
                 _send_mesh(
                     frame['verts'], frame['tris'],
@@ -862,5 +919,3 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
             print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
-
-        self._animation_frames.clear()

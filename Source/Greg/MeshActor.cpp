@@ -52,21 +52,19 @@ void AMeshActor::ApplyMesh(const FMeshPayload& Payload)
     }
 
     // ---- Geometry — normalize, compute normals, compute UVs ----
-    // If the sender supplied global bounds, lock the normalization transform
-    // from them on the first call and reuse it for every subsequent frame.
-    // This keeps the mesh stable when scrubbing through an animation.
-    // Without bounds, recompute from this frame's vertices (static behavior).
-    if (Payload.bHasAnimBounds)
+    // The normalization transform is always derived from the computational-space
+    // bounding box supplied by BoundingBoxFinder (stamped onto the payload by
+    // UMeshBuilderSubsystem at Update time).  We never derive it from the mesh
+    // vertices — the mesh changes frame-to-frame, but the computational space
+    // doesn't, and using mesh bounds would make the transform unstable.
+    if (!Payload.bHasAnimBounds)
     {
-        if (!bNormLocked)
-            LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
-        // else: already locked — reuse the existing transform
+        UE_LOG(LogTemp, Error,
+            TEXT("MeshActor: No bounding box on payload — apply BoundingBoxFinder first. Skipping mesh."));
+        return;
     }
-    else
-    {
-        bNormLocked = false;
-        LockNormalization(Payload.Vertices);
-    }
+    if (!bNormLocked)
+        LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
 
     TArray<FVector> NormVerts = Payload.Vertices;
     NormalizeVertices(NormVerts);
@@ -121,23 +119,21 @@ void AMeshActor::AddAnimationFrame(const FMeshPayload& Payload)
         return;
     }
 
-    // Frame 0 starts a new sequence — reset the normalization lock so the
-    // transform is recomputed from this sequence's geometry, not a stale one.
-    if (Payload.FrameIndex == 0)
-        bNormLocked = false;
-
-    // Lock normalization once per sequence.
-    // Prefer the global animation bounds supplied by the sender (covering all
-    // frames in source units) over frame 0's local vertex bounds.  Using a
-    // per-frame or per-sequence-start bounds causes the bounding box to shift
-    // between frames when the contour changes shape.
-    if (!bNormLocked)
+    // The normalization transform is always derived from the computational-space
+    // bounding box, never from mesh vertices.  Lock it once per sequence (on
+    // frame 0) and reuse it for all subsequent frames.
+    if (!Payload.bHasAnimBounds)
     {
-        if (Payload.bHasAnimBounds)
-            LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
-        else
-            LockNormalization(Payload.Vertices);
+        UE_LOG(LogTemp, Error,
+            TEXT("MeshActor: No bounding box on frame %d — apply BoundingBoxFinder first. Dropping frame."),
+            Payload.FrameIndex);
+        return;
     }
+    if (Payload.FrameIndex == 0)
+        bNormLocked = false;   // start of a new sequence — re-lock from this payload's bounds
+
+    if (!bNormLocked)
+        LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
 
     // Normalize a copy, then compute normals + UVs so playback never
     // re-derives geometry data from scratch on every frame advance.
@@ -315,35 +311,6 @@ void AMeshActor::SetTargetBoxExtents(const FVector& HalfExtents)
         TargetHalfExtents = HalfExtents;
         bNormLocked = false;   // force re-lock with new box extents
     }
-}
-
-void AMeshActor::LockNormalization(const TArray<FVector>& Vertices)
-{
-    if (Vertices.IsEmpty()) return;
-
-    FVector Min = Vertices[0];
-    FVector Max = Vertices[0];
-    for (const FVector& V : Vertices)
-    {
-        Min = Min.ComponentMin(V);
-        Max = Max.ComponentMax(V);
-    }
-
-    NormCenter = (Min + Max) * 0.5f;
-
-    // Compute a single uniform scale that fits the data's bounding box inside
-    // TargetHalfExtents on every axis, preserving the original aspect ratio.
-    // S = min_i( 2 * TargetHalfExtents_i / Extents_i )
-    // A degenerate axis (zero extent) is skipped so it doesn't drive the scale.
-    const FVector Extents = Max - Min;
-    float S = FLT_MAX;
-    if (Extents.X > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.X / Extents.X);
-    if (Extents.Y > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Y / Extents.Y);
-    if (Extents.Z > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Z / Extents.Z);
-    NormScale = (S < FLT_MAX) ? S : 1.f;
-
-    bNormLocked     = true;
-    bHasFixedBounds = false;   // no global bounds → can't lock the component AABB
 }
 
 void AMeshActor::LockNormalizationFromBounds(const FVector& BoundsMin, const FVector& BoundsMax)
