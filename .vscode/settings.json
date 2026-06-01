@@ -1,9 +1,0 @@
-{
-    "clangd.path": "/usr/bin/clangd",
-    "clangd.arguments": [
-        "--compile-commands-dir=${workspaceFolder}/.vscode",
-        "--background-index",
-        "--clang-tidy"
-    ],
-    "C_Cpp.intelliSenseEngine": "disabled"
-}
