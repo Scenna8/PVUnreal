@@ -840,6 +840,11 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         Cancel any in-progress send, then start a new daemon thread to send
         all buffered frames.  Returns immediately so ParaView's pipeline thread
         (and the GUI) stays responsive.
+
+        Also stops ParaView's animation scene — all frames are collected and
+        the UE side plays independently, so there is no reason to keep looping.
+        Without this, loop mode would restart the animation immediately and the
+        Stop button would have no effect.
         """
         if self._send_thread and self._send_thread.is_alive():
             print("[MeshSender] Previous send still running — cancelling it first")
@@ -848,6 +853,15 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         frames_snapshot = dict(self._animation_frames)
         self._animation_frames = {}
+
+        # Stop the ParaView animation before launching the send thread so the
+        # loop doesn't restart and begin collecting frames all over again.
+        try:
+            from paraview.simple import GetAnimationScene
+            GetAnimationScene().Stop()
+            print("[MeshSender] ParaView animation stopped — all frames collected")
+        except Exception as e:
+            print(f"[MeshSender] Could not stop animation scene: {e}")
 
         self._send_thread = threading.Thread(
             target=self._send_buffered_animation,
