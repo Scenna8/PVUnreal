@@ -26,6 +26,15 @@ public:
     AMeshActor();
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
+    /**
+     * Set the half-extents of the target DisplayVolumeActor box (in cm).
+     * Must be called before ApplyMesh / AddAnimationFrame so the normalization
+     * transform fits the ParaView bounding box into this UE box while
+     * preserving the data's aspect ratio.
+     * Default (100, 100, 100) gives the previous ±100 cm cube behaviour.
+     */
+    void SetTargetBoxExtents(const FVector& HalfExtents);
+
     /** Replace the current static mesh and color map. Game thread only. */
     void ApplyMesh(const FMeshPayload& Payload);
 
@@ -90,6 +99,13 @@ private:
     // ---- Normalization ------------------------------------------------------
 
     /**
+     * Half-extents of the target DisplayVolumeActor box (cm).
+     * Normalization maps the ParaView bounding box into this box with a single
+     * uniform scale, so the data's aspect ratio is preserved.
+     */
+    FVector TargetHalfExtents = FVector(100.f);
+
+    /**
      * Center and uniform-scale transform locked to a specific frame.
      * For static meshes this is recomputed on every ApplyMesh call.
      * For animations it is locked to frame 0 and reused for all subsequent
@@ -99,8 +115,35 @@ private:
     FVector NormCenter  = FVector::ZeroVector;
     float   NormScale   = 1.0f;
 
+    /**
+     * When true, ApplyFixedBounds() forces ProcMesh->Bounds to this fixed
+     * local-space box after every CreateMeshSection_LinearColor call.
+     * Prevents UProceduralMeshComponent from recomputing per-frame bounds
+     * from actual vertex positions (which change shape each frame and cause
+     * the bounding box to shift visually).
+     */
+    bool    bHasFixedBounds   = false;
+    FVector FixedBoundsMin    = FVector::ZeroVector;
+    FVector FixedBoundsMax    = FVector::ZeroVector;
+
     /** Compute NormCenter / NormScale from Vertices and set bNormLocked. */
     void LockNormalization(const TArray<FVector>& Vertices);
+
+    /**
+     * Compute NormCenter / NormScale from an explicit global bounding box
+     * (in source units) and set bNormLocked.  Also computes FixedBoundsMin /
+     * FixedBoundsMax — the post-normalization local box — so ApplyFixedBounds()
+     * can lock the ProceduralMeshComponent to a stable bounding box.
+     */
+    void LockNormalizationFromBounds(const FVector& BoundsMin, const FVector& BoundsMax);
+
+    /**
+     * Override ProcMesh->Bounds with the pre-computed fixed box.
+     * Call immediately after every CreateMeshSection_LinearColor so the
+     * engine never sees the per-frame recomputed bounds.
+     * No-op when bHasFixedBounds is false.
+     */
+    void ApplyFixedBounds() const;
 
     /** Apply the locked center+scale transform to every vertex in-place. */
     void NormalizeVertices(TArray<FVector>& Vertices) const;

@@ -83,12 +83,20 @@ def make_color_map(colors, width, height):
 
 def send_mesh(vertices, triangles, uvs=None, normals=None, color_map=None,
               mesh_id=None, volume_id=None, frame_index=None, total_frames=None,
-              playback_fps=None, host="127.0.0.1", port=9000):
+              playback_fps=None, anim_bounds_min=None, anim_bounds_max=None,
+              host="127.0.0.1", port=9000):
     """
     Send a mesh update to Unreal.
 
     Args:
-        vertices:      list of (x, y, z) tuples.
+        vertices:         list of (x, y, z) tuples.
+        anim_bounds_min:  optional (x, y, z) — global min across all animation
+                          frames in source units.  Unreal uses these together with
+                          anim_bounds_max to compute one consistent normalization
+                          transform for the whole sequence so the bounding box
+                          doesn't shift between frames.
+        anim_bounds_max:  optional (x, y, z) — global max across all animation
+                          frames in source units.
         triangles:     flat list of ints — triangle indices.
         uvs:           optional list of (u, v) tuples, one per vertex.
         normals:       optional list of (nx, ny, nz) tuples, one per vertex.
@@ -134,6 +142,19 @@ def send_mesh(vertices, triangles, uvs=None, normals=None, color_map=None,
 
     if color_map:
         payload_dict["colormap"] = color_map
+
+    if anim_bounds_min is not None:
+        payload_dict["anim_bounds_min"] = {
+            "X": float(anim_bounds_min[0]),
+            "Y": float(anim_bounds_min[1]),
+            "Z": float(anim_bounds_min[2]),
+        }
+    if anim_bounds_max is not None:
+        payload_dict["anim_bounds_max"] = {
+            "X": float(anim_bounds_max[0]),
+            "Y": float(anim_bounds_max[1]),
+            "Z": float(anim_bounds_max[2]),
+        }
 
     payload = json.dumps(payload_dict).encode("utf-8")
     header  = struct.pack(">I", len(payload))

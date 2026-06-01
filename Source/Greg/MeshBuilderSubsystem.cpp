@@ -226,8 +226,9 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
     // Resolve index → name → transforms in one sorted-actor pass.
     const TArray<ADisplayVolumeActor*> Sorted = GetSortedVolumeActors(World);
 
-    FString             VolumeName;
-    TArray<FTransform>  Transforms;
+    FString            VolumeName;
+    TArray<FTransform> Transforms;
+    TArray<FVector>    HalfExtents;   // parallel to Transforms
 
     if (Sorted.IsValidIndex(VolumeIndex))
     {
@@ -238,11 +239,14 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
         {
             if (V->VolumeName != VolumeName) continue;
             const FVector HalfExtent = V->VolumeBox->GetScaledBoxExtent();
-            const FVector Scale      = HalfExtent / 100.f;
             UE_LOG(LogTemp, Log,
-                TEXT("MeshBuilder: Matched '%s' at %s, scale %s"),
-                *VolumeName, *V->GetActorLocation().ToString(), *Scale.ToString());
-            Transforms.Add(FTransform(V->GetActorQuat(), V->GetActorLocation(), Scale));
+                TEXT("MeshBuilder: Matched '%s' at %s, box half-extents %s"),
+                *VolumeName, *V->GetActorLocation().ToString(), *HalfExtent.ToString());
+            // Scale = 1: MeshActor derives a uniform aspect-ratio-preserving scale
+            // from the ParaView BB → this box, so the actor transform only carries
+            // position and orientation.
+            Transforms.Add(FTransform(V->GetActorQuat(), V->GetActorLocation(), FVector::OneVector));
+            HalfExtents.Add(HalfExtent);
         }
     }
 
@@ -252,6 +256,7 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
             TEXT("MeshBuilder: No DisplayVolumeActor at index %d — using origin"), VolumeIndex);
         VolumeName = TEXT("(origin)");
         Transforms.Add(FTransform::Identity);
+        HalfExtents.Add(FVector(100.f));   // default: 100 cm cube
     }
 
     const bool bFirstEver = MeshActors.IsEmpty();
@@ -287,6 +292,10 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
 
         if (Mesh)
         {
+            // Tell MeshActor the UE box extents so it can fit the ParaView BB
+            // into this box with a uniform scale (aspect ratio preserved).
+            Mesh->SetTargetBoxExtents(HalfExtents[i]);
+
             if (Payload.FrameIndex >= 0)
                 Mesh->AddAnimationFrame(Payload);
             else
@@ -359,9 +368,8 @@ TArray<FTransform> UMeshBuilderSubsystem::GetDisplayVolumeTransforms(
     for (ADisplayVolumeActor* V : Sorted)
     {
         if (V->VolumeName != TargetName) continue;
-        const FVector HalfExtent = V->VolumeBox->GetScaledBoxExtent();
-        const FVector Scale      = HalfExtent / 100.f;
-        Result.Add(FTransform(V->GetActorQuat(), V->GetActorLocation(), Scale));
+        // Scale = 1: MeshActor owns the uniform aspect-ratio-preserving scale.
+        Result.Add(FTransform(V->GetActorQuat(), V->GetActorLocation(), FVector::OneVector));
     }
     return Result;
 }

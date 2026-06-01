@@ -52,10 +52,21 @@ void AMeshActor::ApplyMesh(const FMeshPayload& Payload)
     }
 
     // ---- Geometry — normalize, compute normals, compute UVs ----
-    // Recompute the normalization transform fresh for every static update so
-    // the mesh always fills its DisplayVolumeActor regardless of data units.
-    bNormLocked = false;
-    LockNormalization(Payload.Vertices);
+    // If the sender supplied global bounds, lock the normalization transform
+    // from them on the first call and reuse it for every subsequent frame.
+    // This keeps the mesh stable when scrubbing through an animation.
+    // Without bounds, recompute from this frame's vertices (static behavior).
+    if (Payload.bHasAnimBounds)
+    {
+        if (!bNormLocked)
+            LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
+        // else: already locked — reuse the existing transform
+    }
+    else
+    {
+        bNormLocked = false;
+        LockNormalization(Payload.Vertices);
+    }
 
     TArray<FVector> NormVerts = Payload.Vertices;
     NormalizeVertices(NormVerts);
@@ -115,9 +126,18 @@ void AMeshActor::AddAnimationFrame(const FMeshPayload& Payload)
     if (Payload.FrameIndex == 0)
         bNormLocked = false;
 
-    // Lock normalization on the first frame we see (should be frame 0).
+    // Lock normalization once per sequence.
+    // Prefer the global animation bounds supplied by the sender (covering all
+    // frames in source units) over frame 0's local vertex bounds.  Using a
+    // per-frame or per-sequence-start bounds causes the bounding box to shift
+    // between frames when the contour changes shape.
     if (!bNormLocked)
-        LockNormalization(Payload.Vertices);
+    {
+        if (Payload.bHasAnimBounds)
+            LockNormalizationFromBounds(Payload.AnimBoundsMin, Payload.AnimBoundsMax);
+        else
+            LockNormalization(Payload.Vertices);
+    }
 
     // Normalize a copy, then compute normals + UVs so playback never
     // re-derives geometry data from scratch on every frame advance.
@@ -170,6 +190,7 @@ void AMeshActor::StartPlayback(float FPS)
     ProcMesh->CreateMeshSection_LinearColor(
         0, First.Vertices, First.Triangles, First.Normals, First.UVs,
         {}, {}, false);
+    ApplyFixedBounds();   // override per-frame computed bounds with the global box
     bSectionCreated        = true;
     CurrentVertexCount     = First.Vertices.Num();
     CurrentTriangleCount   = First.Triangles.Num();
@@ -211,6 +232,7 @@ bool AMeshActor::TickPlayback(float DeltaTime)
         ProcMesh->CreateMeshSection_LinearColor(
             0, Frame.Vertices, Frame.Triangles, Frame.Normals, Frame.UVs,
             {}, {}, false);
+        ApplyFixedBounds();   // override per-frame computed bounds with the global box
         CurrentVertexCount   = Frame.Vertices.Num();
         CurrentTriangleCount = Frame.Triangles.Num();
 
@@ -286,6 +308,15 @@ TArray<FVector2D> AMeshActor::ScalarsToUVs(
     return UVs;
 }
 
+void AMeshActor::SetTargetBoxExtents(const FVector& HalfExtents)
+{
+    if (!TargetHalfExtents.Equals(HalfExtents, 0.01f))
+    {
+        TargetHalfExtents = HalfExtents;
+        bNormLocked = false;   // force re-lock with new box extents
+    }
+}
+
 void AMeshActor::LockNormalization(const TArray<FVector>& Vertices)
 {
     if (Vertices.IsEmpty()) return;
@@ -299,9 +330,58 @@ void AMeshActor::LockNormalization(const TArray<FVector>& Vertices)
     }
 
     NormCenter = (Min + Max) * 0.5f;
-    const float Extent = FMath::Max3(Max.X - Min.X, Max.Y - Min.Y, Max.Z - Min.Z);
-    NormScale  = Extent > 0.f ? 200.f / Extent : 1.f;
+
+    // Compute a single uniform scale that fits the data's bounding box inside
+    // TargetHalfExtents on every axis, preserving the original aspect ratio.
+    // S = min_i( 2 * TargetHalfExtents_i / Extents_i )
+    // A degenerate axis (zero extent) is skipped so it doesn't drive the scale.
+    const FVector Extents = Max - Min;
+    float S = FLT_MAX;
+    if (Extents.X > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.X / Extents.X);
+    if (Extents.Y > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Y / Extents.Y);
+    if (Extents.Z > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Z / Extents.Z);
+    NormScale = (S < FLT_MAX) ? S : 1.f;
+
+    bNormLocked     = true;
+    bHasFixedBounds = false;   // no global bounds → can't lock the component AABB
+}
+
+void AMeshActor::LockNormalizationFromBounds(const FVector& BoundsMin, const FVector& BoundsMax)
+{
+    NormCenter = (BoundsMin + BoundsMax) * 0.5f;
+
+    // Compute a single uniform scale that fits the ParaView bounding box inside
+    // TargetHalfExtents on every axis, preserving the original aspect ratio.
+    // S = min_i( 2 * TargetHalfExtents_i / PVExtents_i )
+    const FVector PVExtents = BoundsMax - BoundsMin;
+    float S = FLT_MAX;
+    if (PVExtents.X > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.X / PVExtents.X);
+    if (PVExtents.Y > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Y / PVExtents.Y);
+    if (PVExtents.Z > 0.f) S = FMath::Min(S, 2.f * TargetHalfExtents.Z / PVExtents.Z);
+    NormScale = (S < FLT_MAX) ? S : 1.f;
+
     bNormLocked = true;
+
+    // Pre-compute the post-normalization local bounding box.
+    // All frames' vertices fit inside this box, so we can lock ProcMesh->Bounds
+    // to it after every CreateMeshSection_LinearColor call and prevent the
+    // engine from recomputing per-frame bounds from actual vertex positions.
+    FixedBoundsMin  = (BoundsMin - NormCenter) * NormScale;
+    FixedBoundsMax  = (BoundsMax - NormCenter) * NormScale;
+    bHasFixedBounds = true;
+}
+
+void AMeshActor::ApplyFixedBounds() const
+{
+    if (!bHasFixedBounds) return;
+
+    // UProceduralMeshComponent::CreateMeshSection_LinearColor calls
+    // UpdateLocalBounds() → UpdateBounds() which overwrites ProcMesh->Bounds
+    // with the per-frame AABB.  We immediately replace it with the fixed global
+    // box so the bounding box stays stable throughout the animation.
+    const FBox LocalBox(FixedBoundsMin, FixedBoundsMax);
+    ProcMesh->Bounds = FBoxSphereBounds(LocalBox)
+        .TransformBy(ProcMesh->GetComponentTransform());
 }
 
 void AMeshActor::NormalizeVertices(TArray<FVector>& Vertices) const

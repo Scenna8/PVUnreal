@@ -572,8 +572,10 @@ def send_animation(vtu_paths, field_name=None, colormap_name="viridis",
 
     # Global spatial transform — one center + scale for all frames
     all_pts = np.vstack(all_pts_list)
+    g_bounds_min = all_pts.min(axis=0)   # raw source units — sent to Unreal so
+    g_bounds_max = all_pts.max(axis=0)   # it can derive the same consistent transform
     g_center, g_scale = compute_animation_transform(all_pts, target_size)
-    g_extents = (all_pts.max(axis=0) - all_pts.min(axis=0)) * g_scale
+    g_extents = (g_bounds_max - g_bounds_min) * g_scale
     print(f"Global extents: "
           f"{g_extents[0]:.1f} x {g_extents[1]:.1f} x {g_extents[2]:.1f} cm")
 
@@ -631,7 +633,10 @@ def send_animation(vtu_paths, field_name=None, colormap_name="viridis",
                   color_map=(cmap if i == 0 else None),
                   mesh_id=frame_id, volume_id=volume_id,
                   frame_index=i, total_frames=n_send,
-                  playback_fps=fps, host=host, port=port)
+                  playback_fps=fps,
+                  anim_bounds_min=g_bounds_min,
+                  anim_bounds_max=g_bounds_max,
+                  host=host, port=port)
         print(f"  [{i + 1}/{n_send}] frame {i} sent")
 
     print(f"All {n_send} frames sent in {time.time() - t0:.1f}s")

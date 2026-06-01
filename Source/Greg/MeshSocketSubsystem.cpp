@@ -164,6 +164,24 @@ uint32 FSocketListenerThread::Run()
                     Payload.ColorMapData.Add((uint8)Px->AsNumber());
             }
 
+            // Global animation bounds — sent by Python from the raw source data so
+            // Unreal can lock normalization to a consistent transform for all frames.
+            if (JsonObj->HasField(TEXT("anim_bounds_min")) &&
+                JsonObj->HasField(TEXT("anim_bounds_max")))
+            {
+                auto MinObj = JsonObj->GetObjectField(TEXT("anim_bounds_min"));
+                auto MaxObj = JsonObj->GetObjectField(TEXT("anim_bounds_max"));
+                Payload.AnimBoundsMin = FVector(
+                    MinObj->GetNumberField(TEXT("X")),
+                    MinObj->GetNumberField(TEXT("Y")),
+                    MinObj->GetNumberField(TEXT("Z")));
+                Payload.AnimBoundsMax = FVector(
+                    MaxObj->GetNumberField(TEXT("X")),
+                    MaxObj->GetNumberField(TEXT("Y")),
+                    MaxObj->GetNumberField(TEXT("Z")));
+                Payload.bHasAnimBounds = true;
+            }
+
             UE_LOG(LogTemp, Log, TEXT("MeshSocket: Parsed frame %d — %d verts, %d tris"),
                 Payload.FrameIndex, Payload.Vertices.Num(), Payload.Triangles.Num());
 

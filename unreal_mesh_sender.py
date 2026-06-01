@@ -2,41 +2,45 @@
 unreal_mesh_sender.py — ParaView plugin
 ========================================
 
-Sends the active dataset to a running Unreal Engine instance over TCP.
-The Unreal project must have MeshBuilderSubsystem active and listening on
-the configured port (default 9000).
+Two filters under Filters → Unreal Engine:
+
+  1. Bounding Box Finder
+     Apply this to any dataset to capture its spatial bounds.  Connect its
+     output to the "Bounding Box" port of the Mesh Sender so the animation
+     uses a fixed, consistent normalization transform across every frame.
+
+  2. Mesh Sender
+     Sends the active dataset (static or animated) to a running Unreal Engine
+     instance over TCP.  Optionally accepts a Bounding Box Finder output on
+     its second input port to lock the bounding box during animation playback.
 
 Install
 -------
     Tools → Manage Plugins → Load New → select this file
     Tick "Auto Load" to load it automatically on startup.
 
-Usage
------
-    1. Load a .vtu / .vtp file in ParaView.
-    2. Select it in the Pipeline Browser.
-    3. Filters → Unreal Engine → Send to Unreal Engine
-    4. Set properties (Scalar Field, Mesh ID, etc.) and click Apply.
-    5. Press Tab in Unreal to cycle between meshes if you have sent several.
-
-Output
-------
-    The filter outputs the triangulated surface that was sent (vtkPolyData),
-    so you can inspect it in ParaView as a confirmation of what Unreal received.
+Typical animation workflow
+--------------------------
+    1. Load your animation source in ParaView.
+    2. Add Filters → Unreal Engine → Bounding Box Finder to it.
+       Apply — note the printed bounds in the Output Messages panel.
+    3. Select your original animation source again.
+    4. Add Filters → Unreal Engine → Mesh Sender.
+       In the Properties panel, connect the Bounding Box Finder output to
+       the "Bounding Box" input port.
+    5. Set Scalar Field, Mesh ID, etc., then click Apply.
 
 Requirements
 ------------
-    pip install numpy vtk matplotlib   (inside ParaView's Python environment)
-    On macOS these are usually pre-installed. If matplotlib is missing, the
-    filter still works but uses a greyscale fallback colormap.
+    pip install numpy matplotlib   (inside ParaView's Python environment)
+    On macOS these are usually pre-installed.  If matplotlib is missing, the
+    filter falls back to a greyscale colormap.
 """
 
 from paraview.util.vtkAlgorithm import (
     VTKPythonAlgorithmBase, smproxy, smproperty, smdomain, smhint
 )
 
-# ParaView 5.10+ uses vtkmodules; older builds still ship the monolithic vtk.
-# Try vtkmodules first and fall back to the legacy package.
 try:
     import vtkmodules.all as vtk
     from vtkmodules.util.numpy_support import vtk_to_numpy
@@ -58,8 +62,7 @@ def _extract_surface_triangles(dataset):
     """
     Return a triangulated vtkPolyData.
     vtkPolyData is triangulated directly.
-    Everything else (vtkUnstructuredGrid, vtkStructuredGrid, etc.) goes
-    through vtkDataSetSurfaceFilter first to extract the outer surface.
+    Everything else goes through vtkDataSetSurfaceFilter first.
     """
     if dataset.IsA("vtkPolyData"):
         tri = vtk.vtkTriangleFilter()
@@ -78,10 +81,8 @@ def _polydata_to_arrays(poly):
     """Return (points float (N,3), indices int (T,3))."""
     points     = vtk_to_numpy(poly.GetPoints().GetData()).astype(float)
     cells_flat = vtk_to_numpy(poly.GetPolys().GetData())
-    indices    = cells_flat.reshape(-1, 4)[:, 1:]   # drop leading '3'
+    indices    = cells_flat.reshape(-1, 4)[:, 1:]
     return points, indices
-
-
 
 
 # =============================================================================
@@ -97,14 +98,13 @@ def _to_scalar(arr):
 def _get_scalar_field(dataset, poly, field_name=None):
     """
     Return (scalar_values, chosen_name).
-    Searches point_data on the surface first, then cell_data on the original dataset.
-    If field_name is None or empty, picks the first available array.
+    Searches point_data on the surface first, then cell_data on the original
+    dataset.  If field_name is None or empty, picks the first available array.
     Raises ValueError if nothing is found.
     """
     def first_name(data_obj):
         return data_obj.GetArray(0).GetName() if data_obj.GetNumberOfArrays() > 0 else None
 
-    # Point data already on the surface
     pd   = poly.GetPointData()
     name = field_name or first_name(pd)
     if name:
@@ -112,7 +112,6 @@ def _get_scalar_field(dataset, poly, field_name=None):
         if arr:
             return _to_scalar(arr), name
 
-    # Cell data: propagate to points then re-extract surface
     cd   = dataset.GetCellData()
     name = field_name or first_name(cd)
     if name:
@@ -135,7 +134,6 @@ def _get_scalar_field(dataset, poly, field_name=None):
     )
 
 
-
 # =============================================================================
 # Colormap helpers
 # =============================================================================
@@ -146,12 +144,7 @@ _COLORMAP_RESOLUTION = 256
 def _build_colormap_from_paraview(field_name, n=_COLORMAP_RESOLUTION):
     """
     Sample ParaView's active colour transfer function for field_name.
-
-    Returns (colormap_dict, vmin, vmax) so the caller can normalise scalar
-    values against the same range — ensuring the colour mapping in Unreal
-    matches exactly what ParaView displays.
-
-    Returns (None, None, None) if the CTF is unavailable.
+    Returns (colormap_dict, vmin, vmax), or (None, None, None) on failure.
     """
     try:
         from paraview.simple import GetColorTransferFunction
@@ -175,11 +168,7 @@ def _build_colormap_from_paraview(field_name, n=_COLORMAP_RESOLUTION):
 
 
 def _build_colormap_matplotlib(colormap_name="viridis", n=_COLORMAP_RESOLUTION):
-    """
-    Fallback: build a colormap from a matplotlib name.
-    Used when ParaView has no CTF for the chosen field.
-    Falls back to greyscale if matplotlib is not installed.
-    """
+    """Fallback: build a colormap from a matplotlib name."""
     try:
         import matplotlib.pyplot as plt
         cmap = plt.get_cmap(colormap_name)
@@ -202,7 +191,6 @@ def _build_colormap_matplotlib(colormap_name="viridis", n=_COLORMAP_RESOLUTION):
 # =============================================================================
 
 def _recv_exact(sock, n):
-    """Read exactly n bytes from sock, raising EOFError if the connection closes early."""
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -214,17 +202,9 @@ def _recv_exact(sock, n):
 
 def _query_volume_names(host, port=9001):
     """
-    Connect to Unreal's volume-query server and return the alphabetically-sorted
-    list of ADisplayVolumeActor VolumeName strings.
-
-    Wire format (big-endian):
-        [4-byte count N]
-        for each name:
-            [4-byte UTF-8 byte length]
-            [UTF-8 bytes]
-
-    Returns a list of strings, or ['Volume 1'] on any failure so the dropdown
-    is never empty.
+    Fetch the alphabetically-sorted list of ADisplayVolumeActor names from
+    Unreal's volume-query server (port 9001).
+    Returns ['Volume 1'] on any failure so the dropdown is never empty.
     """
     try:
         with socket.create_connection((host, port), timeout=3) as s:
@@ -243,93 +223,176 @@ def _send_mesh(vertices, triangles,
                scalars=None, scalar_min=None, scalar_max=None,
                color_map=None, mesh_id=None, volume_id=None,
                frame_index=None, total_frames=None, playback_fps=None,
+               anim_bounds_min=None, anim_bounds_max=None,
                host="127.0.0.1", port=9000):
     """
     Send a length-prefixed JSON payload to Unreal.
     Protocol: 4-byte big-endian length header followed by UTF-8 JSON.
 
-    Raw vertex positions are sent without normalization — Unreal centres and
-    scales them to ±100 cm.  Normals and UVs are also computed Unreal-side from
-    the scalar values and their range.
+    anim_bounds_min / anim_bounds_max: optional (x, y, z) giving the global
+    bounding box in source units.  Unreal uses these to derive one consistent
+    normalization transform across all animation frames.
     """
-    payload_dict = {
+    payload = {
         "verts": [{"X": v[0], "Y": v[1], "Z": v[2]} for v in vertices],
         "tris":  triangles,
     }
     if mesh_id:
-        payload_dict["id"] = mesh_id
+        payload["id"] = mesh_id
     if volume_id is not None:
-        payload_dict["volume_id"] = volume_id
+        payload["volume_id"] = volume_id
     if frame_index is not None:
-        payload_dict["frame"] = frame_index
+        payload["frame"] = frame_index
     if total_frames is not None:
-        payload_dict["total_frames"] = total_frames
+        payload["total_frames"] = total_frames
     if playback_fps is not None:
-        payload_dict["fps"] = playback_fps
+        payload["fps"] = playback_fps
     if scalars is not None:
-        payload_dict["scalars"]    = scalars
-        payload_dict["scalar_min"] = scalar_min if scalar_min is not None else float(min(scalars))
-        payload_dict["scalar_max"] = scalar_max if scalar_max is not None else float(max(scalars))
+        payload["scalars"]    = scalars
+        payload["scalar_min"] = scalar_min if scalar_min is not None else float(min(scalars))
+        payload["scalar_max"] = scalar_max if scalar_max is not None else float(max(scalars))
     if color_map:
-        payload_dict["colormap"] = color_map
+        payload["colormap"] = color_map
+    if anim_bounds_min is not None:
+        payload["anim_bounds_min"] = {
+            "X": float(anim_bounds_min[0]),
+            "Y": float(anim_bounds_min[1]),
+            "Z": float(anim_bounds_min[2]),
+        }
+    if anim_bounds_max is not None:
+        payload["anim_bounds_max"] = {
+            "X": float(anim_bounds_max[0]),
+            "Y": float(anim_bounds_max[1]),
+            "Z": float(anim_bounds_max[2]),
+        }
 
-    payload = json.dumps(payload_dict).encode("utf-8")
-    header  = struct.pack(">I", len(payload))
+    data   = json.dumps(payload).encode("utf-8")
+    header = struct.pack(">I", len(data))
     with socket.create_connection((host, port), timeout=10) as sock:
-        sock.sendall(header + payload)
+        sock.sendall(header + data)
 
 
 # =============================================================================
-# ParaView filter
+# Shared state — written by BoundingBoxFinder, read by MeshSender
 # =============================================================================
 
-@smproxy.filter(name="UnrealMeshSender", label="Send to Unreal Engine")
-@smhint.xml('<AutoApply frequency="1"/>')
+# Mutable container so BoundingBoxFinder can update the value without
+# using the `global` keyword (which can clobber names in ParaView's shared
+# Python namespace).  Keys: 'min' and 'max', each a (x,y,z) tuple or None.
+_bounds_store = {'min': None, 'max': None}
+
+
+# =============================================================================
+# Filter 1 — Bounding Box Finder
+# =============================================================================
+
+@smproxy.filter(name="UnrealBoundingBoxFinder", label="Bounding Box Finder")
+@smhint.xml('<ShowInMenu category="Unreal Engine"/>')
+@smproperty.input(name="Input", port_index=0)
+@smdomain.datatype(dataTypes=["vtkDataSet"])
+class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
+    """
+    Computes the bounding box of the input dataset and outputs a wireframe
+    box (vtkPolyData) you can see in the viewport.
+
+    Connect this filter's output to the "Bounding Box" port of the Mesh Sender
+    to give the animation a fixed, consistent normalization transform so the
+    mesh doesn't jump between frames.
+
+    Apply at whichever time step (or on whichever source) best represents the
+    full spatial extent of your data — e.g. a pre-computed envelope mesh, a
+    specific peak-size frame, or any dataset whose bounds you want to use.
+    """
+
+    def __init__(self):
+        VTKPythonAlgorithmBase.__init__(
+            self, nInputPorts=1, nOutputPorts=1, outputType="vtkDataSet"
+        )
+
+    def FillOutputPortInformation(self, port, info):
+        info.Set(vtk.vtkDataObject.DATA_TYPE_NAME(), "vtkDataObject")
+        return 1
+
+    def RequestDataObject(self, request, inInfo, outInfo):
+        """Mirror the output type to match the input exactly."""
+        inp = vtk.vtkDataObject.GetData(inInfo[0])
+        if inp is None:
+            return 0
+        out = vtk.vtkDataObject.GetData(outInfo)
+        if out is None or not out.IsA(inp.GetClassName()):
+            out = inp.NewInstance()
+            outInfo.GetInformationObject(0).Set(vtk.vtkDataObject.DATA_OBJECT(), out)
+        return 1
+
+    def RequestData(self, request, inInfo, outInfo):
+        # Use vtkDataSet for GetBounds() — vtkDataObject doesn't have it.
+        inp_ds  = vtk.vtkDataSet.GetData(inInfo[0])
+        inp_obj = vtk.vtkDataObject.GetData(inInfo[0])
+        out     = vtk.vtkDataObject.GetData(outInfo)
+
+        if inp_obj is None:
+            print("[BoundingBoxFinder] ERROR: No input.")
+            return 0
+
+        if inp_ds is not None:
+            b = inp_ds.GetBounds()   # (xmin, xmax, ymin, ymax, zmin, zmax)
+            _bounds_store['min'] = (b[0], b[2], b[4])
+            _bounds_store['max'] = (b[1], b[3], b[5])
+            print("[BoundingBoxFinder] Bounds stored — Mesh Sender will pick these up:")
+            print(f"  X: [{b[0]:.6g}, {b[1]:.6g}]")
+            print(f"  Y: [{b[2]:.6g}, {b[3]:.6g}]")
+            print(f"  Z: [{b[4]:.6g}, {b[5]:.6g}]")
+        else:
+            print("[BoundingBoxFinder] WARNING: Input is not a vtkDataSet — "
+                  "cannot read bounds. Try applying to a vtu/vtp source directly.")
+
+        # Pass the input through completely unchanged.
+        out.ShallowCopy(inp_obj)
+        return 1
+
+
+# =============================================================================
+# Filter 2 — Mesh Sender
+# =============================================================================
+
+@smproxy.filter(name="UnrealMeshSender", label="Mesh Sender")
+@smhint.xml('<ShowInMenu category="Unreal Engine"/><AutoApply frequency="1"/>')
 @smproperty.input(name="Input", port_index=0)
 @smdomain.datatype(dataTypes=["vtkDataSet"])
 class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     """
-    ParaView filter that sends the active dataset to Unreal Engine over TCP.
-    The filter passes through a triangulated surface as its output so you can
-    inspect what was transmitted.
+    Sends the input dataset to a running Unreal Engine instance over TCP.
+
+    If a Bounding Box Finder filter has been applied anywhere in the session,
+    its captured bounds are picked up automatically — no port connection needed.
     """
 
     def __init__(self):
         VTKPythonAlgorithmBase.__init__(
             self, nInputPorts=1, nOutputPorts=1, outputType="vtkPolyData"
         )
-        self._field_name  = ""
-        self._colormap    = "viridis"
-        self._mesh_id     = ""
-        self._volume_index = 0          # 0-based index into the sorted name list
-        self._volume_name  = ""         # display string; kept for GetVolumeId
-        self._last_volume_options = []  # cached from GetVolumeIdOptions
-        self._query_port  = 9001
-        self._playback_fps = 24.0
-        # Animation buffering: keyed by frame index (int → dict of arrays).
-        # Cleared whenever a property changes (norm_dirty) or a new sequence starts.
-        self._animation_frames = {}
-        self._host        = "127.0.0.1"
-        self._port        = 9000
-        # Per-field colormap memory: {field_name: colormap_name}
-        self._field_colormaps  = {}
-        # CTF observer state.
-        self._observed_ctf     = None
-        self._ctf_observer_tag = None
-        self._updating_ctf     = False   # True while we are modifying the CTF ourselves
-        # Cached proxy — looked up once so the observer can call UpdatePipeline().
-        self._my_proxy         = None
+        self._field_name           = ""
+        self._colormap             = "viridis"
+        self._mesh_id              = ""
+        self._volume_index         = 0
+        self._volume_name          = ""
+        self._last_volume_options  = []
+        self._query_port           = 9001
+        self._playback_fps         = 24.0
+        self._host                 = "127.0.0.1"
+        self._port                 = 9000
+        self._animation_frames     = {}
+        self._field_colormaps      = {}
+        self._observed_ctf         = None
+        self._ctf_observer_tag     = None
+        self._updating_ctf         = False
+        self._my_proxy             = None
+
+    # ------------------------------------------------------------------ helpers
 
     def _apply_colormap_to_paraview(self, field_name, colormap_name):
-        """
-        Write a matplotlib colormap into ParaView's CTF for field_name.
-        Sets _updating_ctf while doing so to suppress the observer and prevent
-        a double send (the normal Apply pipeline execution handles the send).
-        Returns True on success.
-        """
         try:
             import matplotlib.pyplot as plt
-            import numpy as np
             from paraview.simple import GetColorTransferFunction
 
             cmap  = plt.get_cmap(colormap_name)
@@ -352,11 +415,10 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             return True
         except Exception as e:
             self._updating_ctf = False
-            print(f"[UnrealSender] Could not apply colormap to ParaView CTF: {e}")
+            print(f"[MeshSender] Could not apply colormap to ParaView CTF: {e}")
             return False
 
     def _find_my_proxy(self):
-        """Locate this algorithm's ParaView proxy by scanning GetSources()."""
         try:
             from paraview.simple import GetSources
             for proxy in GetSources().values():
@@ -370,10 +432,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         return None
 
     def _on_ctf_modified(self, obj, event):
-        """Fired whenever the active colour transfer function changes.
-        Calls UpdatePipeline() directly so the filter re-executes — and
-        resends to Unreal — without the user having to click Apply.
-        Ignored when we are the ones modifying the CTF (avoids double send)."""
         if self._updating_ctf:
             return
         if self._my_proxy is None:
@@ -384,7 +442,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                 return
             except Exception:
                 pass
-        self.Modified()  # fallback if proxy lookup failed
+        self.Modified()
 
     # ------------------------------------------------------------------ props
 
@@ -402,16 +460,11 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         </StringVectorProperty>
     """)
     def SetScalarField(self, v):
-        # Save the colormap currently shown for the outgoing field.
         if self._field_name:
             self._field_colormaps[self._field_name] = self._colormap
-
         self._field_name = v or ""
-
-        # Restore the saved colormap for the incoming field (if any).
         if self._field_name in self._field_colormaps:
             self._colormap = self._field_colormaps[self._field_name]
-
         self._animation_frames.clear()
         self.Modified()
 
@@ -445,13 +498,8 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     """)
     def SetColormap(self, v):
         self._colormap = v or "viridis"
-        # Remember this choice for the current field.
         if self._field_name:
             self._field_colormaps[self._field_name] = self._colormap
-        # Write directly into ParaView's CTF for this field so the viewport
-        # updates to match. The CTF observer is suppressed via _updating_ctf,
-        # so self.Modified() is the sole trigger for pipeline re-execution.
-        if self._field_name:
             self._apply_colormap_to_paraview(self._field_name, self._colormap)
         self._animation_frames.clear()
         self.Modified()
@@ -469,14 +517,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     def GetMeshId(self):
         return self._mesh_id
 
-    # ---- Display Volume: dynamic dropdown populated by querying Unreal port 9001 ----
-    #
-    # ParaView calls GetVolumeIdOptions() to populate the StringListDomain, then
-    # shows the result as a dropdown of human-readable VolumeName strings.
-    # The list is re-fetched each time the Properties panel refreshes.
-    # Internally the selected name's 0-based position in the list is sent as the
-    # integer volume_id — the user never sees a number.
-
     @smproperty.xml("""
         <StringVectorProperty name="VolumeIdOptions"
                               command="GetVolumeIdOptions"
@@ -487,7 +527,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         </StringVectorProperty>
     """)
     def GetVolumeIdOptions(self):
-        """Called by ParaView to populate the Display Volume dropdown."""
         self._last_volume_options = _query_volume_names(self._host, self._query_port)
         return self._last_volume_options
 
@@ -547,7 +586,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
     @staticmethod
     def _get_time_steps(info_obj):
-        """Return the full list of available time step values, or []."""
         key = vtk.vtkStreamingDemandDrivenPipeline.TIME_STEPS()
         if info_obj.Has(key):
             return [info_obj.Get(key, i) for i in range(info_obj.Length(key))]
@@ -555,27 +593,38 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
     @staticmethod
     def _get_current_time(info_obj):
-        """Return the currently requested time value, or None."""
         key = vtk.vtkStreamingDemandDrivenPipeline.UPDATE_TIME_STEP()
         if info_obj.Has(key):
             return info_obj.Get(key)
         return None
 
     def RequestData(self, request, inInfo, outInfo):
-        print("[UnrealSender] ---- RequestData called ----")
+        print("[MeshSender] ---- RequestData called ----")
 
-        # --- Get input ---
         inp = vtk.vtkDataSet.GetData(inInfo[0])
         out = vtk.vtkPolyData.GetData(outInfo)
 
         if inp is None:
-            print("[UnrealSender] ERROR: Input dataset is None — is a source selected?")
+            print("[MeshSender] ERROR: No input dataset.")
             return 0
 
-        print(f"[UnrealSender] Input: {inp.GetClassName()}, "
+        print(f"[MeshSender] Input: {inp.GetClassName()}, "
               f"{inp.GetNumberOfPoints()} pts, {inp.GetNumberOfCells()} cells")
 
-        # --- Detect animation time steps ---
+        # --- Pick up bounds from BoundingBoxFinder (shared module variable) ---
+        if _bounds_store['min'] is not None:
+            anim_bounds_min = _bounds_store['min']
+            anim_bounds_max = _bounds_store['max']
+            print(f"[MeshSender] Using captured bounds: "
+                  f"min={anim_bounds_min}  max={anim_bounds_max}")
+
+        else:
+            anim_bounds_min = None
+            anim_bounds_max = None
+            print("[MeshSender] No bounds captured — "
+                  "apply Bounding Box Finder first to lock the animation bounding box")
+
+        # --- Detect animation ---
         info_obj   = inInfo[0].GetInformationObject(0)
         time_steps = self._get_time_steps(info_obj)
         cur_time   = self._get_current_time(info_obj)
@@ -583,78 +632,67 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         is_anim    = n_steps > 1
 
         if is_anim:
-            # Map current time to a frame index (nearest match).
             frame_idx = min(range(n_steps),
                             key=lambda i: abs(time_steps[i] - (cur_time or 0.0)))
-            print(f"[UnrealSender] Animation mode — frame {frame_idx + 1} / {n_steps} "
+            print(f"[MeshSender] Animation — frame {frame_idx + 1}/{n_steps} "
                   f"(t={cur_time:.4g})")
         else:
             frame_idx = -1
-            print("[UnrealSender] Static mode")
+            print("[MeshSender] Static")
 
-        # --- Surface extraction + triangulation ---
+        # --- Surface ---
         try:
             poly = _extract_surface_triangles(inp)
         except Exception as e:
-            print(f"[UnrealSender] ERROR during surface extraction: {e}")
+            print(f"[MeshSender] ERROR during surface extraction: {e}")
             return 0
 
         n_verts = poly.GetNumberOfPoints()
         n_tris  = poly.GetNumberOfCells()
-        print(f"[UnrealSender] Surface: {n_verts} verts, {n_tris} triangles")
+        print(f"[MeshSender] Surface: {n_verts} verts, {n_tris} triangles")
 
         if n_verts == 0 or n_tris == 0:
-            print("[UnrealSender] WARNING: No geometry at this time step — skipping")
+            print("[MeshSender] WARNING: No geometry — skipping")
             if is_anim:
-                # Still store a sentinel so the frame count tracks correctly.
                 self._animation_frames[frame_idx] = None
                 if len(self._animation_frames) == n_steps:
-                    self._send_buffered_animation(n_steps)
+                    self._send_buffered_animation(n_steps, anim_bounds_min, anim_bounds_max)
             return 1
 
         out.ShallowCopy(poly)
 
-        # --- Geometry arrays ---
-        # Send raw coordinates — Unreal normalises to ±100 cm.
         points, indices = _polydata_to_arrays(poly)
         verts = [(float(p[0]), float(p[1]), float(p[2])) for p in points]
         tris  = indices.flatten().tolist()
 
         # --- Scalar field ---
-        pd = poly.GetPointData()
-        available = [pd.GetArray(i).GetName() for i in range(pd.GetNumberOfArrays())]
-        print(f"[UnrealSender] Point arrays on surface: {available}")
-
         field_name = self._field_name.strip() or None
         try:
             scalar_values, chosen = _get_scalar_field(inp, poly, field_name)
-            print(f"[UnrealSender] Scalar '{chosen}': "
-                  f"n={len(scalar_values)}, "
+            print(f"[MeshSender] Scalar '{chosen}': "
                   f"min={scalar_values.min():.4g}, max={scalar_values.max():.4g}")
         except ValueError as e:
-            print(f"[UnrealSender] Warning: {e} — no color")
+            print(f"[MeshSender] Warning: {e} — no color")
             scalar_values = None
             chosen = None
 
-        # --- Branch: animation buffering vs. immediate static send ---
+        # --- Animation buffering vs. static send ---
         if is_anim:
-            # Buffer raw scalars; global range is resolved once all frames arrive.
             self._animation_frames[frame_idx] = {
                 'verts':   verts,
                 'tris':    tris,
                 'scalars': scalar_values,
                 'chosen':  chosen,
+                'bounds_min': anim_bounds_min,
+                'bounds_max': anim_bounds_max,
             }
-            print(f"[UnrealSender] Buffered frame {frame_idx} "
-                  f"({len(self._animation_frames)} / {n_steps} collected)")
+            print(f"[MeshSender] Buffered frame {frame_idx} "
+                  f"({len(self._animation_frames)}/{n_steps})")
 
             if len(self._animation_frames) == n_steps:
-                self._send_buffered_animation(n_steps)
+                self._send_buffered_animation(n_steps, anim_bounds_min, anim_bounds_max)
         else:
-            # Static send — resolve colormap and scalar range.
             if scalar_values is not None:
-                # Try to get colormap + range from ParaView's active CTF so the
-                # Unreal colour mapping matches the ParaView viewport exactly.
                 cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
                 if cmap is not None:
                     vmin, vmax = ctf_vmin, ctf_vmax
@@ -663,7 +701,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                     vmin = float(scalar_values.min())
                     vmax = float(scalar_values.max())
                 scalars_list = scalar_values.tolist()
-                # Attach CTF observer so external CTF edits trigger a re-send.
                 try:
                     from paraview.simple import GetColorTransferFunction
                     vtk_ctf = GetColorTransferFunction(chosen).GetClientSideObject()
@@ -682,40 +719,36 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
             mesh_id   = self._mesh_id.strip() or None
             volume_id = self._volume_index
-            print(f"[UnrealSender] Mesh ID: '{mesh_id or 'default'}'  "
-                  f"Volume: '{self._volume_name}' (index {volume_id})")
-            print(f"[UnrealSender] Connecting to {self._host}:{self._port} ...")
+            print(f"[MeshSender] Sending static mesh '{mesh_id or 'default'}' "
+                  f"to {self._host}:{self._port} ...")
             try:
                 _send_mesh(verts, tris,
                            scalars=scalars_list, scalar_min=vmin, scalar_max=vmax,
-                           color_map=cmap, mesh_id=mesh_id,
-                           volume_id=volume_id,
+                           color_map=cmap, mesh_id=mesh_id, volume_id=volume_id,
                            host=self._host, port=self._port)
-                print(f"[UnrealSender] SUCCESS — {len(verts)} verts, "
-                      f"{len(tris) // 3} tris sent")
+                print(f"[MeshSender] SUCCESS — {len(verts)} verts, "
+                      f"{len(tris)//3} tris sent")
             except OSError as e:
-                print(f"[UnrealSender] ERROR: Connection failed — {e}")
+                print(f"[MeshSender] ERROR: Connection failed — {e}")
             except Exception as e:
-                print(f"[UnrealSender] ERROR: {type(e).__name__}: {e}")
+                print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
 
         return 1
 
-    def _send_buffered_animation(self, total_frames):
+    def _send_buffered_animation(self, total_frames, anim_bounds_min, anim_bounds_max):
         """
         Called once all animation frames have been buffered.
-
-        Computes a global scalar range across every frame so colours are
-        consistent throughout the animation, then sends each frame to Unreal
-        as an indexed animation packet.  Unreal starts looped playback
-        automatically once all packets arrive.
+        Computes a global scalar range, then sends each frame as an indexed
+        animation packet.  Passes anim_bounds_min/max (from the Bounding Box
+        Finder) so Unreal can lock the normalization transform for the whole
+        sequence.
         """
-        print(f"[UnrealSender] All {total_frames} frames collected — sending animation ...")
+        print(f"[MeshSender] All {total_frames} frames collected — sending ...")
 
-        mesh_id   = self._mesh_id.strip()   or None
+        mesh_id   = self._mesh_id.strip() or None
         volume_id = self._volume_index
         fps       = self._playback_fps
 
-        # Collect scalar arrays across all frames (skip sentinels / empty frames).
         valid_frames = [(i, self._animation_frames[i])
                         for i in range(total_frames)
                         if self._animation_frames.get(i) is not None]
@@ -726,44 +759,45 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             g_min = float(min(s.min() for s in all_scalars))
             g_max = float(max(s.max() for s in all_scalars))
             cmap  = _build_colormap_matplotlib(self._colormap)
-            print(f"[UnrealSender] Global scalar range: {g_min:.4g} – {g_max:.4g}")
+            print(f"[MeshSender] Global scalar range: {g_min:.4g} – {g_max:.4g}")
         else:
             g_min = g_max = 0.0
             cmap = None
 
+        if anim_bounds_min is not None:
+            print(f"[MeshSender] Bounds: min={anim_bounds_min}  max={anim_bounds_max}")
+        else:
+            print("[MeshSender] No bounding box — Unreal will normalise per frame 0")
+
         n_valid = len(valid_frames)
-        print(f"[UnrealSender] Sending {n_valid} non-empty frames  "
-              f"mesh='{mesh_id or 'default'}'  "
-              f"volume='{self._volume_name}' (index {volume_id})  "
-              f"fps={fps:.1f}")
+        print(f"[MeshSender] Sending {n_valid} frames  "
+              f"mesh='{mesh_id or 'default'}'  fps={fps:.1f}")
 
         try:
-            sent = 0
             for seq_idx, (_, frame) in enumerate(valid_frames):
                 scalars = frame.get('scalars')
                 _send_mesh(
                     frame['verts'], frame['tris'],
-                    scalars    = scalars.tolist() if scalars is not None else None,
-                    scalar_min = g_min,
-                    scalar_max = g_max,
-                    color_map  = (cmap if seq_idx == 0 else None),
-                    mesh_id    = mesh_id,
-                    volume_id  = volume_id,
+                    scalars       = scalars.tolist() if scalars is not None else None,
+                    scalar_min    = g_min,
+                    scalar_max    = g_max,
+                    color_map     = (cmap if seq_idx == 0 else None),
+                    mesh_id       = mesh_id,
+                    volume_id     = volume_id,
                     frame_index   = seq_idx,
                     total_frames  = n_valid,
                     playback_fps  = fps,
+                    anim_bounds_min = anim_bounds_min,
+                    anim_bounds_max = anim_bounds_max,
                     host = self._host,
                     port = self._port,
                 )
-                sent += 1
-                print(f"[UnrealSender]   frame {sent} / {n_valid} sent")
+                print(f"[MeshSender]   frame {seq_idx + 1}/{n_valid} sent")
 
-            print(f"[UnrealSender] Animation complete — "
-                  f"{sent} frames → {self._host}:{self._port}")
+            print(f"[MeshSender] Animation complete → {self._host}:{self._port}")
         except OSError as e:
-            print(f"[UnrealSender] ERROR: Connection failed — {e}")
+            print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
-            print(f"[UnrealSender] ERROR: {type(e).__name__}: {e}")
+            print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
 
-        # Clear the buffer so a re-play of the ParaView animation re-sends cleanly.
         self._animation_frames.clear()

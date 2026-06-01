@@ -56,6 +56,17 @@ struct FMeshPayload
     int32         ColorMapWidth  = 0;
     int32         ColorMapHeight = 0;
 
+    /**
+     * Global bounding box of all animation frames in source units (the same
+     * coordinate space as Vertices before normalization).  When present,
+     * AMeshActor uses these instead of frame 0's vertex bounds to compute
+     * NormCenter / NormScale, guaranteeing a consistent normalization transform
+     * — and therefore a stable bounding box — across every frame.
+     */
+    bool    bHasAnimBounds  = false;
+    FVector AnimBoundsMin   = FVector::ZeroVector;
+    FVector AnimBoundsMax   = FVector::ZeroVector;
+
     // =========================================================================
     // Computed by AMeshActor (not transmitted)
     // =========================================================================
