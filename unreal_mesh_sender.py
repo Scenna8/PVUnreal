@@ -733,7 +733,8 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         n_valid = len(valid_frames)
         print(f"[UnrealSender] Sending {n_valid} non-empty frames  "
-              f"mesh='{mesh_id or 'default'}'  volume={volume_id}  "
+              f"mesh='{mesh_id or 'default'}'  "
+              f"volume='{self._volume_name}' (index {volume_id})  "
               f"fps={fps:.1f}")
 
         try:

@@ -27,15 +27,6 @@ public class Greg : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });
 
-		if (Target.bBuildEditor)
-		{
-			PrivateDependencyModuleNames.AddRange(new string[] {
-				"UnrealEd",
-				"PropertyEditor",
-				"SlateCore",
-				"DetailCustomizations"
-			});
-		}
 
 		PublicIncludePaths.AddRange(new string[] {
 			"Greg",

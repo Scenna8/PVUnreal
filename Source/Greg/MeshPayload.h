@@ -22,8 +22,10 @@ struct FMeshPayload
     /** Routing identifier — matched to a MeshActor key. */
     FString MeshId = TEXT("default");
 
-    /** Which ADisplayVolumeActor to place this mesh inside. */
-    int32 VolumeId = 1;
+    /** 0-based index into the alphabetically-sorted list of ADisplayVolumeActors
+     *  by VolumeName.  Set by the ParaView plugin from the dropdown selection —
+     *  users see names, never this number. */
+    int32 VolumeId = 0;
 
     /** -1 = static mesh.  >= 0 = one frame of an animation sequence. */
     int32 FrameIndex  = -1;
