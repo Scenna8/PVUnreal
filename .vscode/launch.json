@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Greg Editor (Mac, Development)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "/Users/Shared/Epic Games/UE_5.7/Engine/Binaries/Mac/UnrealEditor",
+            "args": [
+                "/Users/jackabram/Documents/Unreal Projects/Greg/Greg.uproject"
+            ],
+            "cwd": "/Users/Shared/Epic Games/UE_5.7",
+            "stopOnEntry": false
+        },
+        {
+            "name": "Attach to Greg Editor (Mac)",
+            "type": "lldb",
+            "request": "attach",
+            "program": "/Users/Shared/Epic Games/UE_5.7/Engine/Binaries/Mac/UnrealEditor",
+            "waitFor": true
+        }
+    ]
+}

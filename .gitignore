@@ -1,0 +1,49 @@
+# =============================================================================
+# Unreal Engine — generated / local files
+# =============================================================================
+
+# Build outputs
+Binaries/
+Build/
+Intermediate/
+
+# Shader / derived data caches (fully regenerated on open)
+DerivedDataCache/
+DDC/
+
+# Editor state, logs, autosaves, local config
+Saved/
+
+# Visual Studio / Rider / CLion
+.vs/
+.idea/
+*.VC.db
+*.VC.VC.opendb
+*.opensdf
+*.opendb
+*.sdf
+*.suo
+*.user
+
+# Xcode (Mac)
+*.xcworkspace/
+*.xcodeproj/
+xcuserdata/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# =============================================================================
+# Always keep these
+# =============================================================================
+!Source/
+!Content/
+!Config/
+!Plugins/
+!*.uproject
