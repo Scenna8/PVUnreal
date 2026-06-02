@@ -238,6 +238,19 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
     // ---- Update: stamp bounds, process all buffered payloads, signal done ----
     // (PayloadType == EPayloadType::Update)
 
+    // Bounds must arrive before Update — enforce the ordering.
+    if (!bHasRetainedBounds)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("MeshBuilder: Update received but no bounds have been stored — "
+                 "apply BoundingBoxFinder before MeshSender. Discarding %d payload(s)."),
+            PendingMeshPayloads.Num());
+        PendingMeshPayloads.Empty();
+        if (Payload.CompletionPromise.IsValid())
+            Payload.CompletionPromise->SetValue(1);   // non-zero = error ACK
+        return;
+    }
+
     UE_LOG(LogTemp, Warning,
         TEXT("MeshBuilder: Update — committing %d buffered payload(s)"),
         PendingMeshPayloads.Num());

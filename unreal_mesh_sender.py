@@ -72,6 +72,7 @@ import socket
 import struct
 import json
 import threading
+import paraview.servermanager as sm
 
 
 # =============================================================================
@@ -683,19 +684,14 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         print(f"[MeshSender] Input: {inp.GetClassName()}, "
               f"{inp.GetNumberOfPoints()} pts, {inp.GetNumberOfCells()} cells")
 
-        if _bounds_store['min'] is None:
-            print("[MeshSender] NOTE: No bounds in shared store — "
-                  "ensure Bounding Box Finder has been applied and sent bounds to UE")
-
         # --- Register pipeline-end observer once per filter instance ---
         # EndEvent fires when the full pipeline update finishes.  We use it to
         # send the Update message after all RequestData calls for this update
         # are done — without buffering any geometry on the Python side.
         if not getattr(sm, '_ue_update_observer_set', False):
             sm._ue_update_observer_set = True
-            import paraview.servermanager as _sm
-            self._progress_handler = _sm.vtkSMProxyManager.GetProxyManager() \
-                                         .GetProgressHandler()
+            self._progress_handler = sm.vtkSMProxyManager.GetProxyManager() \
+                                        .GetProgressHandler()
             self._progress_handler.AddObserver("EndEvent", self._on_pipeline_end)
             print("[MeshSender] Pipeline EndEvent observer registered")
 
