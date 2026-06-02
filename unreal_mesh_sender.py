@@ -542,7 +542,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         self._field_name = v or ""
         if self._field_name in self._field_colormaps:
             self._colormap = self._field_colormaps[self._field_name]
-        self._animation_frames.clear()
         self.Modified()
 
     def GetScalarField(self):
@@ -578,7 +577,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         if self._field_name:
             self._field_colormaps[self._field_name] = self._colormap
             self._apply_colormap_to_paraview(self._field_name, self._colormap)
-        self._animation_frames.clear()
         self.Modified()
 
     def GetColormap(self):
@@ -588,7 +586,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                               default_values="")
     def SetMeshId(self, v):
         self._mesh_id = v or ""
-        self._animation_frames.clear()
         self.Modified()
 
     def GetMeshId(self):
@@ -640,33 +637,10 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     def GetPlaybackFPS(self):
         return self._playback_fps
 
-    @smproperty.xml("""
-        <IntVectorProperty name="CancelSend" label="Cancel Send"
-            command="SetCancelSend"
-            number_of_elements="1"
-            default_values="0"
-            animateable="0">
-            <BooleanDomain name="bool"/>
-            <Documentation>
-                Set to cancel an in-progress animation send.
-                The current frame finishes (waiting for its ACK), then the
-                send loop exits cleanly.
-            </Documentation>
-        </IntVectorProperty>
-    """)
-    def SetCancelSend(self, v):
-        if v:
-            self._cancel_flag.set()
-            print("[MeshSender] Cancel requested — will stop after current frame")
-
-    def GetCancelSend(self):
-        return 0   # always reads back as unchecked
-
     @smproperty.stringvector(name="Host", label="Unreal Host",
                               default_values="127.0.0.1")
     def SetHost(self, v):
         self._host = v or "127.0.0.1"
-        self._animation_frames.clear()
         self.Modified()
 
     def GetHost(self):
@@ -675,7 +649,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     @smproperty.intvector(name="Port", label="Port", default_values=[9000])
     def SetPort(self, v):
         self._port = int(v)
-        self._animation_frames.clear()
         self.Modified()
 
     def GetPort(self):
