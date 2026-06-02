@@ -218,20 +218,41 @@ def _query_volume_names(host, port=9001):
     return ['Volume 1']
 
 
-def _transact(payload_dict, host, port, timeout=10):
+class _UENotAvailable(Exception):
+    """Raised when Unreal is not reachable — lets callers skip cleanly."""
+    pass
+
+
+def _transact(payload_dict, host, port, connect_timeout=2, ack_timeout=10):
     """
     Send a length-prefixed JSON message and read back the 4-byte big-endian
     ACK code that Unreal sends after processing.  Returns the ACK value
     (0 = OK, non-zero = error).
 
-    The Update message blocks Unreal's socket thread until the game thread
-    finishes building all meshes, so use a longer timeout for it.
+    Uses a short connect_timeout so a missing UE instance fails immediately
+    rather than freezing ParaView.  Raises _UENotAvailable on any connection
+    or timeout failure so callers can skip gracefully.
     """
     data   = json.dumps(payload_dict).encode("utf-8")
     header = struct.pack(">I", len(data))
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+    try:
+        sock = socket.create_connection((host, port), timeout=connect_timeout)
+    except ConnectionRefusedError:
+        raise _UENotAvailable(f"Connection refused — is Unreal running on {host}:{port}?")
+    except socket.timeout:
+        raise _UENotAvailable(f"Connection timed out — no reply from {host}:{port}")
+    except OSError as e:
+        raise _UENotAvailable(f"Cannot reach {host}:{port} — {e}")
+
+    with sock:
+        sock.settimeout(ack_timeout)   # separate, longer timeout for the ACK read
         sock.sendall(header + data)
-        ack_bytes = _recv_exact(sock, 4)
+        try:
+            ack_bytes = _recv_exact(sock, 4)
+        except socket.timeout:
+            raise _UENotAvailable(
+                f"Unreal connected but ACK timed out after {ack_timeout}s "
+                f"— game thread may be stuck")
         return struct.unpack(">I", ack_bytes)[0]
 
 
@@ -272,14 +293,13 @@ def _send_update(mesh_id, volume_id, host, port):
     Send an update message and block until Unreal ACKs it.
     Unreal defers the ACK until all buffered meshes have been transformed
     and rendered on the game thread — so this call is synchronous end-to-end.
-    Use a generous timeout since the game thread may need time to build meshes.
     """
     payload = {"type": "update"}
     if mesh_id:
         payload["id"] = mesh_id
     if volume_id is not None:
         payload["volume_id"] = volume_id
-    return _transact(payload, host, port, timeout=60)
+    return _transact(payload, host, port, ack_timeout=15)
 
 
 # =============================================================================
@@ -325,6 +345,8 @@ def _on_render_end(obj, event):
             print("[MeshSender] Update ACK OK — Unreal display updated")
         else:
             print(f"[MeshSender] WARNING: Update ACK={ack} (check UE Output Log)")
+    except _UENotAvailable as e:
+        print(f"[MeshSender] Update skipped — {e}")
     except Exception as e:
         print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
 
@@ -840,8 +862,8 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                 else:
                     print(f"[MeshSender] WARNING: Update ACK={ack}")
 
-        except OSError as e:
-            print(f"[MeshSender] ERROR: Connection failed — {e}")
+        except _UENotAvailable as e:
+            print(f"[MeshSender] Unreal not available — {e}")
         except Exception as e:
             print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
 
