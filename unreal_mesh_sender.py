@@ -74,11 +74,55 @@ import json
 import threading
 import paraview.servermanager as sm
 
-# Module-level flag: True once the view EndEvent observer has been installed.
-# Stored on sm so it survives across filter instances and plugin reloads within
-# the same ParaView session.
+# Module-level state stored on sm so it survives across filter instances.
 if not hasattr(sm, '_ue_view_observer_installed'):
     sm._ue_view_observer_installed = False
+if not hasattr(sm, '_ue_update_host'):
+    sm._ue_update_host = "127.0.0.1"
+if not hasattr(sm, '_ue_update_port'):
+    sm._ue_update_port = 9000
+
+
+def _ensure_view_observer_global():
+    """
+    Install _on_view_end_global on the active view once per session.
+    Safe to call from any filter instance — the sm flag prevents duplicates.
+    """
+    if sm._ue_view_observer_installed:
+        return
+    try:
+        from paraview.simple import GetActiveView
+        view = GetActiveView()
+        if view is None:
+            return
+        vtk_view = view.GetClientSideObject()
+        if vtk_view is None:
+            return
+        vtk_view.AddObserver('EndEvent', _on_view_end_global, 1.0)
+        sm._ue_view_observer_installed = True
+        print("[MeshSender] Installed view EndEvent observer")
+    except Exception as e:
+        print(f"[MeshSender] WARNING: Could not install view observer — {e}")
+
+
+def _on_view_end_global(obj, event):
+    """
+    Module-level EndEvent callback — not tied to any filter instance.
+    Fires once after each full ParaView pipeline update / render completes.
+    Spawns a daemon thread so the render thread is not blocked on UE's ACK.
+    """
+    host = sm._ue_update_host
+    port = sm._ue_update_port
+    def _send():
+        try:
+            print("[MeshSender] Sending Update ...")
+            _send_update(host=host, port=port)
+            print("[MeshSender] Update ACK received — UE committed all meshes")
+        except OSError as e:
+            print(f"[MeshSender] Update ERROR: Connection failed — {e}")
+        except Exception as e:
+            print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
+    threading.Thread(target=_send, daemon=True).start()
 
 
 # =============================================================================
@@ -795,10 +839,13 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                        port         = self._port)
             print(f"[MeshSender] Mesh sent and ACK'd — "
                   f"{len(verts)} verts, {len(tris)//3} tris")
+            # Keep the module-level host/port current (in case they were changed).
+            sm._ue_update_host = self._host
+            sm._ue_update_port = self._port
             # Register the view EndEvent observer once so Update is sent after
             # *all* filters in this pipeline pass have finished — not one Update
             # per mesh, but one Update per full ParaView iteration.
-            self._ensure_view_observer()
+            _ensure_view_observer_global()
         except OSError as e:
             print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
@@ -806,47 +853,3 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         return 1
 
-    def _ensure_view_observer(self):
-        """
-        Install an EndEvent observer on the active render view (once per session).
-        The flag lives on sm so any MeshSender instance can see it — only the
-        first caller installs the observer; all subsequent calls are no-ops.
-        """
-        if sm._ue_view_observer_installed:
-            return
-        try:
-            from paraview.simple import GetActiveView
-            view = GetActiveView()
-            if view is None:
-                return
-            vtk_view = view.GetClientSideObject()
-            if vtk_view is None:
-                return
-            vtk_view.AddObserver('EndEvent', self._on_view_end, 1.0)
-            sm._ue_view_observer_installed = True
-            print("[MeshSender] Installed view EndEvent observer")
-        except Exception as e:
-            print(f"[MeshSender] WARNING: Could not install view observer — {e}")
-
-    def _on_view_end(self, obj, event):
-        """
-        Fires once after each full ParaView pipeline update.  Spawns a daemon
-        thread to send the Update message so the render thread is not blocked
-        waiting for UE's deferred ACK.
-        """
-        host, port = self._host, self._port
-        threading.Thread(
-            target=self._send_update_async,
-            args=(host, port),
-            daemon=True,
-        ).start()
-
-    def _send_update_async(self, host, port):
-        try:
-            print("[MeshSender] Sending Update ...")
-            _send_update(host=host, port=port)
-            print("[MeshSender] Update ACK received — UE committed all meshes")
-        except OSError as e:
-            print(f"[MeshSender] Update ERROR: Connection failed — {e}")
-        except Exception as e:
-            print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
