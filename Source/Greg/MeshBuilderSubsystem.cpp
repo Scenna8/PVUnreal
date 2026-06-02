@@ -238,18 +238,11 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
     // ---- Update: stamp bounds, process all buffered payloads, signal done ----
     // (PayloadType == EPayloadType::Update)
 
-    // Bounds must arrive before Update — enforce the ordering.
     if (!bHasRetainedBounds)
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("MeshBuilder: Update received but no bounds have been stored — "
-                 "apply BoundingBoxFinder before MeshSender. Discarding %d payload(s)."),
-            PendingMeshPayloads.Num());
-        PendingMeshPayloads.Empty();
-        if (Payload.CompletionPromise.IsValid())
-            Payload.CompletionPromise->SetValue(1);   // non-zero = error ACK
-        return;
-    }
+        UE_LOG(LogTemp, Warning,
+            TEXT("MeshBuilder: Update received without retained bounds — "
+                 "normalization will be computed per-frame. Apply BoundingBoxFinder "
+                 "before MeshSender for stable animation."));
 
     UE_LOG(LogTemp, Warning,
         TEXT("MeshBuilder: Update — committing %d buffered payload(s)"),
@@ -263,8 +256,14 @@ void UMeshBuilderSubsystem::HandlePayload(const FMeshPayload& Payload)
             P.AnimBoundsMin  = RetainedBoundsMin;
             P.AnimBoundsMax  = RetainedBoundsMax;
         }
+        // If no retained bounds, bHasAnimBounds stays false and ApplyMesh falls
+        // back to normalizing from the frame's own vertices.
         ProcessMeshPayload(P);
     }
+
+    UE_LOG(LogTemp, Warning,
+        TEXT("MeshBuilder: Pending list purged — %d payload(s) committed, clearing buffer"),
+        PendingMeshPayloads.Num());
     PendingMeshPayloads.Empty();
 
     // Signal the socket thread that processing is complete so it can send the ACK.

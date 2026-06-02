@@ -5,49 +5,29 @@ unreal_mesh_sender.py — ParaView plugin
 Two filters under Filters → Unreal Engine:
 
   1. Bounding Box Finder
-     Apply this to any dataset to send its spatial bounds to Unreal Engine
-     immediately.  UE retains those bounds and uses them when building meshes
-     so that every frame shares one consistent normalization transform.
-
-     Place this filter directly after your data source (importer) so that the
-     full computational-space bounds are known before any mesh data is sent.
+     Apply this to any dataset to capture its spatial bounds.  The Mesh Sender
+     picks these up automatically and sends them with every frame so Unreal can
+     lock the normalization transform across the whole sequence.
 
   2. Mesh Sender
-     Sends the active dataset (static or animated) to a running Unreal Engine
-     instance over TCP.  Each mesh or frame is buffered by UE on receipt.
-     After all meshes are sent, a final Update message tells UE to commit:
-     it stamps the retained BB onto every buffered payload, computes the
-     ParaView-BB → UE-display-box transform, and builds the mesh actors.
-
-Protocol (all messages on port 9000)
--------------------------------------
-  Every message is length-prefixed JSON:
-    [4-byte big-endian length][UTF-8 JSON]
-  Every message receives a 4-byte big-endian ACK from UE before the
-  connection closes:
-    bounds / mesh  → ACK on receipt
-    update         → ACK after all meshes are built (deferred)
-
-  Message types:
-    {"type": "bounds", "min": {X,Y,Z}, "max": {X,Y,Z}}
-    {"type": "mesh",   "id": ..., "verts": [...], "tris": [...], ...}
-    {"type": "update"}
+     Sends the active dataset to a running Unreal Engine instance over TCP.
+     Each frame is sent immediately as ParaView requests it (synchronous) —
+     Unreal updates in lock-step with ParaView's current time.
 
 Install
 -------
     Tools → Manage Plugins → Load New → select this file
     Tick "Auto Load" to load it automatically on startup.
 
-Typical workflow
------------------
-    1. Load your data source in ParaView.
-    2. Add Filters → Unreal Engine → Bounding Box Finder to it.  Apply.
-       UE immediately stores the computational-space bounds.
-    3. Select your original source again.
-    4. Add Filters → Unreal Engine → Mesh Sender.  Set Scalar Field,
-       Mesh ID, etc., then click Apply.
-       Meshes are buffered by UE; when all are sent an Update is issued
-       and UE builds the final mesh actors.
+Typical animation workflow
+--------------------------
+    1. Load your animation source in ParaView.
+    2. Add Filters → Unreal Engine → Bounding Box Finder to the importer.
+       Apply — note the printed bounds in the Output Messages panel.
+    3. Select your original animation source again.
+    4. Add Filters → Unreal Engine → Mesh Sender.
+    5. Set Scalar Field, Mesh ID, etc., then click Apply.
+    6. Scrub or play the timeline — Unreal mirrors ParaView's current frame.
 
 Requirements
 ------------
@@ -71,58 +51,6 @@ import numpy as np
 import socket
 import struct
 import json
-import threading
-import paraview.servermanager as sm
-
-# Module-level state stored on sm so it survives across filter instances.
-if not hasattr(sm, '_ue_view_observer_installed'):
-    sm._ue_view_observer_installed = False
-if not hasattr(sm, '_ue_update_host'):
-    sm._ue_update_host = "127.0.0.1"
-if not hasattr(sm, '_ue_update_port'):
-    sm._ue_update_port = 9000
-
-
-def _ensure_view_observer_global():
-    """
-    Install _on_view_end_global on the active view once per session.
-    Safe to call from any filter instance — the sm flag prevents duplicates.
-    """
-    if sm._ue_view_observer_installed:
-        return
-    try:
-        from paraview.simple import GetActiveView
-        view = GetActiveView()
-        if view is None:
-            return
-        vtk_view = view.GetClientSideObject()
-        if vtk_view is None:
-            return
-        vtk_view.AddObserver('EndEvent', _on_view_end_global, 1.0)
-        sm._ue_view_observer_installed = True
-        print("[MeshSender] Installed view EndEvent observer")
-    except Exception as e:
-        print(f"[MeshSender] WARNING: Could not install view observer — {e}")
-
-
-def _on_view_end_global(obj, event):
-    """
-    Module-level EndEvent callback — not tied to any filter instance.
-    Fires once after each full ParaView pipeline update / render completes.
-    Spawns a daemon thread so the render thread is not blocked on UE's ACK.
-    """
-    host = sm._ue_update_host
-    port = sm._ue_update_port
-    def _send():
-        try:
-            print("[MeshSender] Sending Update ...")
-            _send_update(host=host, port=port)
-            print("[MeshSender] Update ACK received — UE committed all meshes")
-        except OSError as e:
-            print(f"[MeshSender] Update ERROR: Connection failed — {e}")
-        except Exception as e:
-            print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
-    threading.Thread(target=_send, daemon=True).start()
 
 
 # =============================================================================
@@ -290,54 +218,37 @@ def _query_volume_names(host, port=9001):
     return ['Volume 1']
 
 
-def _send_message(payload, host="127.0.0.1", port=9000, timeout=60):
+def _transact(payload_dict, host, port, timeout=10):
     """
-    Send a length-prefixed JSON message to Unreal and wait for the 4-byte ACK.
+    Send a length-prefixed JSON message and read back the 4-byte big-endian
+    ACK code that Unreal sends after processing.  Returns the ACK value
+    (0 = OK, non-zero = error).
 
-    Protocol:
-      → [4-byte big-endian payload length][UTF-8 JSON]
-      ← [4-byte big-endian status code]   (0 = OK)
-
-    Raises OSError on connection failure and RuntimeError on a non-zero ACK.
-    The Update message uses a longer timeout because UE defers the ACK until
-    all mesh actors are built.
+    The Update message blocks Unreal's socket thread until the game thread
+    finishes building all meshes, so use a longer timeout for it.
     """
-    data   = json.dumps(payload).encode("utf-8")
+    data   = json.dumps(payload_dict).encode("utf-8")
     header = struct.pack(">I", len(data))
-    with socket.create_connection((host, port), timeout=10) as sock:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.sendall(header + data)
-        # Wait up to `timeout` seconds for the ACK (Update can take a while).
-        sock.settimeout(timeout)
-        ack_bytes = b""
-        while len(ack_bytes) < 4:
-            chunk = sock.recv(4 - len(ack_bytes))
-            if not chunk:
-                raise OSError("Connection closed before ACK was received")
-            ack_bytes += chunk
-    code = struct.unpack(">I", ack_bytes)[0]
-    if code != 0:
-        raise RuntimeError(f"UE returned error ACK {code} for message type '{payload.get('type', '?')}'")
+        ack_bytes = _recv_exact(sock, 4)
+        return struct.unpack(">I", ack_bytes)[0]
 
 
-def _send_bounds(bounds_min, bounds_max, host="127.0.0.1", port=9000):
-    """Send a bounds message and wait for the ACK."""
-    _send_message({
+def _send_bounds(bounds_min, bounds_max, host, port):
+    """Send a bounds message and return the ACK code."""
+    return _transact({
         "type": "bounds",
         "min": {"X": float(bounds_min[0]), "Y": float(bounds_min[1]), "Z": float(bounds_min[2])},
         "max": {"X": float(bounds_max[0]), "Y": float(bounds_max[1]), "Z": float(bounds_max[2])},
-    }, host=host, port=port)
+    }, host, port)
 
 
 def _send_mesh(vertices, triangles,
                scalars=None, scalar_min=None, scalar_max=None,
                color_map=None, mesh_id=None, volume_id=None,
-               frame_index=None, total_frames=None, playback_fps=None,
                host="127.0.0.1", port=9000):
-    """
-    Send a mesh message and wait for the ACK (ACKed on receipt, not on build).
-    Bounds are no longer included here — they are sent separately by
-    BoundingBoxFinder via _send_bounds() before any mesh messages.
-    """
+    """Send a mesh message and return the ACK code."""
     payload = {
         "type": "mesh",
         "verts": [{"X": v[0], "Y": v[1], "Z": v[2]} for v in vertices],
@@ -347,39 +258,119 @@ def _send_mesh(vertices, triangles,
         payload["id"] = mesh_id
     if volume_id is not None:
         payload["volume_id"] = volume_id
-    if frame_index is not None:
-        payload["frame"] = frame_index
-    if total_frames is not None:
-        payload["total_frames"] = total_frames
-    if playback_fps is not None:
-        payload["fps"] = playback_fps
     if scalars is not None:
         payload["scalars"]    = scalars
         payload["scalar_min"] = scalar_min if scalar_min is not None else float(min(scalars))
         payload["scalar_max"] = scalar_max if scalar_max is not None else float(max(scalars))
     if color_map:
         payload["colormap"] = color_map
+    return _transact(payload, host, port)
 
-    _send_message(payload, host=host, port=port)
 
-
-def _send_update(host="127.0.0.1", port=9000):
+def _send_update(mesh_id, volume_id, host, port):
     """
-    Send the Update message and wait for the deferred ACK.
-    UE sends the ACK only after all buffered meshes have been built, so this
-    call may block for several seconds on large datasets — the timeout is 120 s.
+    Send an update message and block until Unreal ACKs it.
+    Unreal defers the ACK until all buffered meshes have been transformed
+    and rendered on the game thread — so this call is synchronous end-to-end.
+    Use a generous timeout since the game thread may need time to build meshes.
     """
-    _send_message({"type": "update"}, host=host, port=port, timeout=120)
+    payload = {"type": "update"}
+    if mesh_id:
+        payload["id"] = mesh_id
+    if volume_id is not None:
+        payload["volume_id"] = volume_id
+    return _transact(payload, host, port, timeout=60)
 
 
 # =============================================================================
-# Shared state — written by BoundingBoxFinder, read by MeshSender
+# Shared state — written by BoundingBoxFinder / MeshSender, read by both
 # =============================================================================
 
-# Mutable container so BoundingBoxFinder can update the value without
-# using the `global` keyword (which can clobber names in ParaView's shared
-# Python namespace).  Keys: 'min' and 'max', each a (x,y,z) tuple or None.
+# Bounding box captured by BoundingBoxFinder.
 _bounds_store = {'min': None, 'max': None}
+
+# Observer / pending-update state.
+# 'observer_installed' is set once when the EndEvent observer is added to the
+# active render window.  'pending_update' is raised by RequestData after each
+# mesh send and cleared by the observer callback once the update is sent.
+_server_state = {
+    'observer_installed': False,
+    'pending_update':     False,
+    'host':               '127.0.0.1',
+    'port':               9000,
+    'mesh_id':            None,
+    'volume_id':          0,
+}
+
+
+def _on_render_end(obj, event):
+    """
+    Called by VTK after the render view finishes drawing.
+    If a mesh was sent during the preceding pipeline update, send the Update
+    message now — by this point all MeshSender RequestData calls for the
+    current frame are complete and their payloads are buffered in Unreal.
+    """
+    print(f"[MeshSender] EndEvent fired — pending_update={_server_state['pending_update']}")
+    if not _server_state['pending_update']:
+        return
+    _server_state['pending_update'] = False
+    try:
+        ack = _send_update(
+            _server_state['mesh_id'],
+            _server_state['volume_id'],
+            _server_state['host'],
+            _server_state['port'],
+        )
+        if ack == 0:
+            print("[MeshSender] Update ACK OK — Unreal display updated")
+        else:
+            print(f"[MeshSender] WARNING: Update ACK={ack} (check UE Output Log)")
+    except Exception as e:
+        print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
+
+
+def _ensure_render_observer():
+    """
+    Install _on_render_end as an EndEvent observer on the active render window
+    (once only).  Accesses the window via GetRenderer().GetRenderWindow() —
+    more reliably wrapped in Python than GetRenderWindow() directly on
+    vtkPVRenderView.  Stores a reference to prevent GC.
+    Returns True if an observer is in place.
+    """
+    print("Ensure Render observer.")
+    if _server_state['observer_installed']:
+        print("[MeshSender] EndEvent observer already installed")
+        return True
+    try:
+        from paraview.simple import GetActiveView
+        view = GetActiveView()
+        if view is None:
+            print("[MeshSender] WARNING: No active view — cannot install EndEvent observer")
+            return False
+
+        vtk_view = view.GetClientSideObject()
+        print(f"[MeshSender] Client-side view class: {vtk_view.GetClassName()}")
+
+        # Access the render window through the renderer, which is the standard
+        # VTK path and is always Python-wrapped.
+        renderer = vtk_view.GetRenderer()
+        rw = renderer.GetRenderWindow()
+        print(f"[MeshSender] Render window class: {rw.GetClassName()}")
+
+        tag = rw.AddObserver('EndEvent', _on_render_end)
+        print(f"[MeshSender] EndEvent observer installed on render window (tag={tag})")
+
+        # Keep a reference so neither the render window nor the observer is GC'd.
+        _server_state['_rw_ref'] = rw
+        _server_state['_observer_tag'] = tag
+        _server_state['observer_installed'] = True
+        return True
+
+    except Exception as e:
+        import traceback
+        print(f"[MeshSender] WARNING: Could not install EndEvent observer: {e}")
+        traceback.print_exc()
+        return False
 
 
 # =============================================================================
@@ -392,41 +383,20 @@ _bounds_store = {'min': None, 'max': None}
 @smdomain.datatype(dataTypes=["vtkDataSet"])
 class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
     """
-    Computes the bounding box of the input dataset and outputs a wireframe
-    box (vtkPolyData) you can see in the viewport.
+    Computes the bounding box of the input dataset and stores it so the Mesh
+    Sender can include it in every frame it sends.  Unreal uses it to lock the
+    normalization transform for the whole sequence — preventing the mesh from
+    jumping or rescaling between frames.
 
-    Connect this filter's output to the "Bounding Box" port of the Mesh Sender
-    to give the animation a fixed, consistent normalization transform so the
-    mesh doesn't jump between frames.
-
-    Apply at whichever time step (or on whichever source) best represents the
-    full spatial extent of your data — e.g. a pre-computed envelope mesh, a
-    specific peak-size frame, or any dataset whose bounds you want to use.
+    Place this filter directly on the importer (before any time-varying
+    filters) so the bounds reflect the full spatial extent of the data and
+    never change as the timeline advances.
     """
 
     def __init__(self):
         VTKPythonAlgorithmBase.__init__(
             self, nInputPorts=1, nOutputPorts=1, outputType="vtkDataSet"
         )
-        self._host = "127.0.0.1"
-        self._port = 9000
-
-    @smproperty.stringvector(name="Host", label="Unreal Host",
-                              default_values="127.0.0.1")
-    def SetHost(self, v):
-        self._host = v or "127.0.0.1"
-        self.Modified()
-
-    def GetHost(self):
-        return self._host
-
-    @smproperty.intvector(name="Port", label="Port", default_values=[9000])
-    def SetPort(self, v):
-        self._port = int(v)
-        self.Modified()
-
-    def GetPort(self):
-        return self._port
 
     def FillOutputPortInformation(self, port, info):
         info.Set(vtk.vtkDataObject.DATA_TYPE_NAME(), "vtkDataObject")
@@ -455,20 +425,12 @@ class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
 
         if inp_ds is not None:
             b = inp_ds.GetBounds()   # (xmin, xmax, ymin, ymax, zmin, zmax)
-            bmin = (b[0], b[2], b[4])
-            bmax = (b[1], b[3], b[5])
-            # Keep the shared store for any legacy callers.
-            _bounds_store['min'] = bmin
-            _bounds_store['max'] = bmax
-            print("[BoundingBoxFinder] Bounds computed:")
+            _bounds_store['min'] = (b[0], b[2], b[4])
+            _bounds_store['max'] = (b[1], b[3], b[5])
+            print("[BoundingBoxFinder] Bounds stored — included with every Mesh Sender frame:")
             print(f"  X: [{b[0]:.6g}, {b[1]:.6g}]")
             print(f"  Y: [{b[2]:.6g}, {b[3]:.6g}]")
             print(f"  Z: [{b[4]:.6g}, {b[5]:.6g}]")
-            try:
-                _send_bounds(bmin, bmax, host=self._host, port=self._port)
-                print(f"[BoundingBoxFinder] Bounds sent to UE ({self._host}:{self._port}) — ACK received")
-            except Exception as e:
-                print(f"[BoundingBoxFinder] WARNING: Could not send bounds to UE: {e}")
         else:
             print("[BoundingBoxFinder] WARNING: Input is not a vtkDataSet — "
                   "cannot read bounds. Try applying to a vtu/vtp source directly.")
@@ -483,15 +445,20 @@ class BoundingBoxFinderFilter(VTKPythonAlgorithmBase):
 # =============================================================================
 
 @smproxy.filter(name="UnrealMeshSender", label="Mesh Sender")
-@smhint.xml('<ShowInMenu category="Unreal Engine"/>')
+@smhint.xml('<ShowInMenu category="Unreal Engine"/><AutoApply frequency="1"/>')
 @smproperty.input(name="Input", port_index=0)
 @smdomain.datatype(dataTypes=["vtkDataSet"])
 class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     """
     Sends the input dataset to a running Unreal Engine instance over TCP.
 
+    Operates synchronously: each frame is sent immediately as ParaView
+    requests it.  Unreal updates in lock-step with ParaView's timeline.
+
     If a Bounding Box Finder filter has been applied anywhere in the session,
-    its captured bounds are picked up automatically — no port connection needed.
+    its captured bounds are included with every send so Unreal locks the
+    normalization transform on the first frame and reuses it for all subsequent
+    frames — preventing the mesh from jumping.
     """
 
     def __init__(self):
@@ -505,7 +472,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         self._volume_name          = ""
         self._last_volume_options  = []
         self._query_port           = 9001
-        self._playback_fps         = 24.0
         self._host                 = "127.0.0.1"
         self._port                 = 9000
         self._field_colormaps      = {}
@@ -513,6 +479,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         self._ctf_observer_tag     = None
         self._updating_ctf         = False
         self._my_proxy             = None
+        self._last_sent_bounds     = None   # track sent bounds to avoid redundant sends
 
     # ------------------------------------------------------------------ helpers
 
@@ -677,15 +644,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
     def GetVolumeId(self):
         return self._volume_name
 
-    @smproperty.doublevector(name="PlaybackFPS", label="Playback FPS",
-                              default_values=[24.0])
-    def SetPlaybackFPS(self, v):
-        self._playback_fps = float(v) if v > 0 else 24.0
-        self.Modified()
-
-    def GetPlaybackFPS(self):
-        return self._playback_fps
-
     @smproperty.stringvector(name="Host", label="Unreal Host",
                               default_values="127.0.0.1")
     def SetHost(self, v):
@@ -732,26 +690,30 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         print(f"[MeshSender] Input: {inp.GetClassName()}, "
               f"{inp.GetNumberOfPoints()} pts, {inp.GetNumberOfCells()} cells")
 
-        # --- Detect animation ---
+        # --- Pick up bounds from BoundingBoxFinder (shared module variable) ---
+        if _bounds_store['min'] is not None:
+            anim_bounds_min = _bounds_store['min']
+            anim_bounds_max = _bounds_store['max']
+            print(f"[MeshSender] Using captured bounds: "
+                  f"min={anim_bounds_min}  max={anim_bounds_max}")
+        else:
+            anim_bounds_min = None
+            anim_bounds_max = None
+            print("[MeshSender] No bounds captured — "
+                  "apply Bounding Box Finder first to lock the normalization transform")
+
+        # --- Log current time step ---
         info_obj   = inInfo[0].GetInformationObject(0)
         time_steps = self._get_time_steps(info_obj)
         cur_time   = self._get_current_time(info_obj)
         n_steps    = len(time_steps)
-        is_anim    = n_steps > 1
 
-        if is_anim:
+        if n_steps > 1:
             frame_idx = min(range(n_steps),
                             key=lambda i: abs(time_steps[i] - (cur_time or 0.0)))
-            print(f"[MeshSender] Animation — frame {frame_idx + 1}/{n_steps} "
-                  f"(t={cur_time:.4g})")
-            # Disconnect the CTF observer for animation — it calls UpdatePipeline()
-            # which would keep driving the pipeline after Stop is clicked.
-            if self._observed_ctf is not None:
-                self._observed_ctf.RemoveObserver(self._ctf_observer_tag)
-                self._observed_ctf     = None
-                self._ctf_observer_tag = None
+            print(f"[MeshSender] Frame {frame_idx + 1}/{n_steps} (t={cur_time:.4g})")
         else:
-            frame_idx = -1
+            frame_idx = 0
             print("[MeshSender] Static")
 
         # --- Surface ---
@@ -779,77 +741,108 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         field_name = self._field_name.strip() or None
         try:
             scalar_values, chosen = _get_scalar_field(inp, poly, field_name)
-            print(f"[MeshSender] Scalar '{chosen}': "
+            print(f"XXX [MeshSender] Scalar '{chosen}': "
                   f"min={scalar_values.min():.4g}, max={scalar_values.max():.4g}")
         except ValueError as e:
             print(f"[MeshSender] Warning: {e} — no color")
             scalar_values = None
             chosen = None
 
-        # --- Colormap ---
+        print("AAA")
+        
+        # --- Build colormap ---
         if scalar_values is not None:
-            if is_anim:
-                # For animation, build from matplotlib — ParaView CTF lookup
-                # during playback is unreliable and only needed on frame 0.
-                cmap  = (_build_colormap_matplotlib(self._colormap)
-                         if frame_idx == 0 else None)
-                vmin  = float(scalar_values.min())
-                vmax  = float(scalar_values.max())
+            print(f"{scalar_values} is not None.")
+            cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
+            print("_build_colormap_from_paraview returned.")
+            if cmap is not None:
+                print(f"{ctf_vmin} - {ctf_vmax}")
+                vmin, vmax = ctf_vmin, ctf_vmax
             else:
-                cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
-                if cmap is not None:
-                    vmin, vmax = ctf_vmin, ctf_vmax
-                else:
-                    cmap = _build_colormap_matplotlib(self._colormap)
-                    vmin = float(scalar_values.min())
-                    vmax = float(scalar_values.max())
-                # Attach CTF observer so colormap changes re-send the static mesh.
-                try:
-                    from paraview.simple import GetColorTransferFunction
-                    vtk_ctf = GetColorTransferFunction(chosen).GetClientSideObject()
-                    if self._observed_ctf is not vtk_ctf:
-                        if self._observed_ctf is not None:
-                            self._observed_ctf.RemoveObserver(self._ctf_observer_tag)
-                        self._ctf_observer_tag = vtk_ctf.AddObserver(
-                            'ModifiedEvent', self._on_ctf_modified)
-                        self._observed_ctf = vtk_ctf
-                except Exception:
-                    pass
+                print("cmap is null")
+                cmap = _build_colormap_matplotlib(self._colormap)
+                vmin = float(scalar_values.min())
+                vmax = float(scalar_values.max())
             scalars_list = scalar_values.tolist()
+            try:
+                from paraview.simple import GetColorTransferFunction
+                vtk_ctf = GetColorTransferFunction(chosen).GetClientSideObject()
+                if self._observed_ctf is not vtk_ctf:
+                    if self._observed_ctf is not None:
+                        self._observed_ctf.RemoveObserver(self._ctf_observer_tag)
+                    self._ctf_observer_tag = vtk_ctf.AddObserver(
+                        'ModifiedEvent', self._on_ctf_modified)
+                    self._observed_ctf = vtk_ctf
+            except Exception:
+                print("Error")
+                pass
         else:
             scalars_list = None
             vmin = vmax = None
             cmap = None
 
-        # --- Send mesh immediately — UE buffers it ---
+        # --- Send protocol ---
+        # Ensure the EndEvent observer is installed so the Update message is
+        # sent after the full render cycle rather than mid-pipeline.
+        has_observer = _ensure_render_observer()
+
         mesh_id   = self._mesh_id.strip() or None
         volume_id = self._volume_index
+        label     = (f"frame {frame_idx + 1}/{n_steps}"
+                     if n_steps > 1 else "static mesh")
+
         try:
-            _send_mesh(verts, tris,
-                       scalars      = scalars_list,
-                       scalar_min   = vmin,
-                       scalar_max   = vmax,
-                       color_map    = cmap,
-                       mesh_id      = mesh_id,
-                       volume_id    = volume_id,
-                       frame_index  = frame_idx if is_anim else None,
-                       total_frames = n_steps   if is_anim else None,
-                       playback_fps = self._playback_fps if is_anim else None,
-                       host         = self._host,
-                       port         = self._port)
-            print(f"[MeshSender] Mesh sent and ACK'd — "
-                  f"{len(verts)} verts, {len(tris)//3} tris")
-            # Keep the module-level host/port current (in case they were changed).
-            sm._ue_update_host = self._host
-            sm._ue_update_port = self._port
-            # Register the view EndEvent observer once so Update is sent after
-            # *all* filters in this pipeline pass have finished — not one Update
-            # per mesh, but one Update per full ParaView iteration.
-            _ensure_view_observer_global()
+            # 1. Bounds — send once (or whenever the BB changes).
+            #    Fall back to this frame's vertex extents if no BB filter is set up.
+            if anim_bounds_min is None:
+                pts = np.array(verts)
+                anim_bounds_min = tuple(pts.min(axis=0))
+                anim_bounds_max = tuple(pts.max(axis=0))
+                print("[MeshSender] No BoundingBoxFinder bounds — "
+                      "using this frame's vertex extents (animation may jump)")
+
+            if anim_bounds_min != self._last_sent_bounds:
+                ack = _send_bounds(anim_bounds_min, anim_bounds_max,
+                                   self._host, self._port)
+                if ack == 0:
+                    self._last_sent_bounds = anim_bounds_min
+                    print("[MeshSender] Bounds sent OK")
+                else:
+                    print(f"[MeshSender] WARNING: Bounds ACK={ack}")
+
+            # 2. Mesh — raw ParaView-space vertices, buffered in Unreal.
+            print(f"[MeshSender] Sending mesh ({label}) '{mesh_id or 'default'}' ...")
+            ack = _send_mesh(verts, tris,
+                             scalars=scalars_list, scalar_min=vmin, scalar_max=vmax,
+                             color_map=cmap, mesh_id=mesh_id, volume_id=volume_id,
+                             host=self._host, port=self._port)
+            if ack != 0:
+                print(f"[MeshSender] WARNING: Mesh ACK={ack}")
+            else:
+                print(f"[MeshSender] Mesh ACK OK — {len(verts)} verts, "
+                      f"{len(tris) // 3} tris")
+
+            # 3. Update — deferred to EndEvent observer so it fires after all
+            #    pipeline filters finish for this frame.  If no observer could
+            #    be installed, send inline as fallback.
+            if has_observer:
+                _server_state['host']          = self._host
+                _server_state['port']          = self._port
+                _server_state['mesh_id']       = mesh_id
+                _server_state['volume_id']     = volume_id
+                _server_state['pending_update'] = True
+                print("[MeshSender] Update pending — will send on EndEvent")
+            else:
+                print("[MeshSender] No observer — sending update inline ...")
+                ack = _send_update(mesh_id, volume_id, self._host, self._port)
+                if ack == 0:
+                    print("[MeshSender] Update ACK OK — Unreal display updated")
+                else:
+                    print(f"[MeshSender] WARNING: Update ACK={ack}")
+
         except OSError as e:
             print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
             print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
 
         return 1
-
