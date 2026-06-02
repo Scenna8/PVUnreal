@@ -457,14 +457,13 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         self._playback_fps         = 24.0
         self._host                 = "127.0.0.1"
         self._port                 = 9000
-        self._animation_frames     = {}
         self._field_colormaps      = {}
         self._observed_ctf         = None
         self._ctf_observer_tag     = None
         self._updating_ctf         = False
         self._my_proxy             = None
-        self._send_thread          = None
-        self._cancel_flag          = threading.Event()
+        self._mesh_sent            = False   # True once a mesh is sent in the current update
+        self._progress_handler     = None    # holds the sm.ProgressHandler reference
 
     # ------------------------------------------------------------------ helpers
 
@@ -711,11 +710,21 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
         print(f"[MeshSender] Input: {inp.GetClassName()}, "
               f"{inp.GetNumberOfPoints()} pts, {inp.GetNumberOfCells()} cells")
 
-        # Bounds are now sent directly by BoundingBoxFinder to UE.
-        # Log a reminder if the shared store is empty (BB filter not applied).
         if _bounds_store['min'] is None:
             print("[MeshSender] NOTE: No bounds in shared store — "
                   "ensure Bounding Box Finder has been applied and sent bounds to UE")
+
+        # --- Register pipeline-end observer once per filter instance ---
+        # EndEvent fires when the full pipeline update finishes.  We use it to
+        # send the Update message after all RequestData calls for this update
+        # are done — without buffering any geometry on the Python side.
+        if not getattr(sm, '_ue_update_observer_set', False):
+            sm._ue_update_observer_set = True
+            import paraview.servermanager as _sm
+            self._progress_handler = _sm.vtkSMProxyManager.GetProxyManager() \
+                                         .GetProgressHandler()
+            self._progress_handler.AddObserver("EndEvent", self._on_pipeline_end)
+            print("[MeshSender] Pipeline EndEvent observer registered")
 
         # --- Detect animation ---
         info_obj   = inInfo[0].GetInformationObject(0)
@@ -729,12 +738,11 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                             key=lambda i: abs(time_steps[i] - (cur_time or 0.0)))
             print(f"[MeshSender] Animation — frame {frame_idx + 1}/{n_steps} "
                   f"(t={cur_time:.4g})")
-            # Disconnect the CTF observer — it calls UpdatePipeline() on every
-            # colormap change, which keeps driving the pipeline even after the
-            # ParaView Stop button is clicked.  It's only needed for static meshes.
+            # Disconnect the CTF observer for animation — it calls UpdatePipeline()
+            # which would keep driving the pipeline after Stop is clicked.
             if self._observed_ctf is not None:
                 self._observed_ctf.RemoveObserver(self._ctf_observer_tag)
-                self._observed_ctf    = None
+                self._observed_ctf     = None
                 self._ctf_observer_tag = None
         else:
             frame_idx = -1
@@ -753,10 +761,6 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
 
         if n_verts == 0 or n_tris == 0:
             print("[MeshSender] WARNING: No geometry — skipping")
-            if is_anim:
-                self._animation_frames[frame_idx] = None
-                if len(self._animation_frames) == n_steps:
-                    self._launch_send_thread(n_steps)
             return 1
 
         out.ShallowCopy(poly)
@@ -776,21 +780,16 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
             scalar_values = None
             chosen = None
 
-        # --- Animation buffering vs. static send ---
-        if is_anim:
-            self._animation_frames[frame_idx] = {
-                'verts':   verts,
-                'tris':    tris,
-                'scalars': scalar_values,
-                'chosen':  chosen,
-            }
-            print(f"[MeshSender] Buffered frame {frame_idx} "
-                  f"({len(self._animation_frames)}/{n_steps})")
-
-            if len(self._animation_frames) == n_steps:
-                self._launch_send_thread(n_steps)
-        else:
-            if scalar_values is not None:
+        # --- Colormap ---
+        if scalar_values is not None:
+            if is_anim:
+                # For animation, build from matplotlib — ParaView CTF lookup
+                # during playback is unreliable and only needed on frame 0.
+                cmap  = (_build_colormap_matplotlib(self._colormap)
+                         if frame_idx == 0 else None)
+                vmin  = float(scalar_values.min())
+                vmax  = float(scalar_values.max())
+            else:
                 cmap, ctf_vmin, ctf_vmax = _build_colormap_from_paraview(chosen)
                 if cmap is not None:
                     vmin, vmax = ctf_vmin, ctf_vmax
@@ -798,7 +797,7 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                     cmap = _build_colormap_matplotlib(self._colormap)
                     vmin = float(scalar_values.min())
                     vmax = float(scalar_values.max())
-                scalars_list = scalar_values.tolist()
+                # Attach CTF observer so colormap changes re-send the static mesh.
                 try:
                     from paraview.simple import GetColorTransferFunction
                     vtk_ctf = GetColorTransferFunction(chosen).GetClientSideObject()
@@ -810,126 +809,63 @@ class UnrealMeshSenderFilter(VTKPythonAlgorithmBase):
                         self._observed_ctf = vtk_ctf
                 except Exception:
                     pass
-            else:
-                scalars_list = None
-                vmin = vmax = None
-                cmap = None
-
-            mesh_id   = self._mesh_id.strip() or None
-            volume_id = self._volume_index
-            print(f"[MeshSender] Sending static mesh '{mesh_id or 'default'}' "
-                  f"to {self._host}:{self._port} ...")
-            try:
-                _send_mesh(verts, tris,
-                           scalars=scalars_list, scalar_min=vmin, scalar_max=vmax,
-                           color_map=cmap, mesh_id=mesh_id, volume_id=volume_id,
-                           host=self._host, port=self._port)
-                print(f"[MeshSender] Mesh buffered by UE — sending Update ...")
-                _send_update(host=self._host, port=self._port)
-                print(f"[MeshSender] SUCCESS — Update ACK received "
-                      f"({len(verts)} verts, {len(tris)//3} tris)")
-            except OSError as e:
-                print(f"[MeshSender] ERROR: Connection failed — {e}")
-            except Exception as e:
-                print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
-
-        return 1
-
-    def _launch_send_thread(self, total_frames):
-        """
-        Cancel any in-progress send, then start a new daemon thread to send
-        all buffered frames.  Returns immediately so ParaView's pipeline thread
-        (and the GUI) stays responsive.
-
-        Also stops ParaView's animation scene — all frames are collected and
-        the UE side plays independently, so there is no reason to keep looping.
-        Without this, loop mode would restart the animation immediately and the
-        Stop button would have no effect.
-        """
-        if self._send_thread and self._send_thread.is_alive():
-            print("[MeshSender] Previous send still running — cancelling it first")
-            self._cancel_flag.set()
-            self._send_thread.join(timeout=5)
-
-        frames_snapshot = dict(self._animation_frames)
-        self._animation_frames = {}
-
-        # Stop the ParaView animation before launching the send thread so the
-        # loop doesn't restart and begin collecting frames all over again.
-        try:
-            from paraview.simple import GetAnimationScene
-            GetAnimationScene().Stop()
-            print("[MeshSender] ParaView animation stopped — all frames collected")
-        except Exception as e:
-            print(f"[MeshSender] Could not stop animation scene: {e}")
-
-        self._send_thread = threading.Thread(
-            target=self._send_buffered_animation,
-            args=(total_frames, frames_snapshot),
-            daemon=True,
-        )
-        self._send_thread.start()
-        print(f"[MeshSender] Send thread started for {total_frames} frames")
-
-    def _send_buffered_animation(self, total_frames, frames_snapshot):
-        """
-        Runs on a daemon thread.  Sends each frame as a mesh message (ACKed on
-        receipt), checks the cancel flag between frames, then sends a single
-        Update message and waits for the deferred ACK from UE.
-        """
-        self._cancel_flag.clear()
-
-        mesh_id   = self._mesh_id.strip() or None
-        volume_id = self._volume_index
-        fps       = self._playback_fps
-
-        valid_frames = [(i, frames_snapshot[i])
-                        for i in range(total_frames)
-                        if frames_snapshot.get(i) is not None]
-        all_scalars = [f['scalars'] for _, f in valid_frames
-                       if f.get('scalars') is not None]
-
-        if all_scalars:
-            g_min = float(min(s.min() for s in all_scalars))
-            g_max = float(max(s.max() for s in all_scalars))
-            cmap  = _build_colormap_matplotlib(self._colormap)
-            print(f"[MeshSender] Global scalar range: {g_min:.4g} – {g_max:.4g}")
+            scalars_list = scalar_values.tolist()
         else:
-            g_min = g_max = 0.0
+            scalars_list = None
+            vmin = vmax = None
             cmap = None
 
-        n_valid = len(valid_frames)
-        print(f"[MeshSender] Sending {n_valid} frames  "
-              f"mesh='{mesh_id or 'default'}'  fps={fps:.1f}")
-
+        # --- Send mesh immediately — UE buffers it ---
+        mesh_id   = self._mesh_id.strip() or None
+        volume_id = self._volume_index
         try:
-            for seq_idx, (_, frame) in enumerate(valid_frames):
-                if self._cancel_flag.is_set():
-                    print(f"[MeshSender] Cancelled after {seq_idx}/{n_valid} frames")
-                    return
-
-                scalars = frame.get('scalars')
-                _send_mesh(
-                    frame['verts'], frame['tris'],
-                    scalars      = scalars.tolist() if scalars is not None else None,
-                    scalar_min   = g_min,
-                    scalar_max   = g_max,
-                    color_map    = (cmap if seq_idx == 0 else None),
-                    mesh_id      = mesh_id,
-                    volume_id    = volume_id,
-                    frame_index  = seq_idx,
-                    total_frames = n_valid,
-                    playback_fps = fps,
-                    host         = self._host,
-                    port         = self._port,
-                )
-                print(f"[MeshSender]   frame {seq_idx + 1}/{n_valid} buffered by UE")
-
-            print(f"[MeshSender] All frames buffered — sending Update ...")
-            _send_update(host=self._host, port=self._port)
-            print(f"[MeshSender] Animation complete — Update ACK received "
-                  f"→ {self._host}:{self._port}")
+            _send_mesh(verts, tris,
+                       scalars      = scalars_list,
+                       scalar_min   = vmin,
+                       scalar_max   = vmax,
+                       color_map    = cmap,
+                       mesh_id      = mesh_id,
+                       volume_id    = volume_id,
+                       frame_index  = frame_idx if is_anim else None,
+                       total_frames = n_steps   if is_anim else None,
+                       playback_fps = self._playback_fps if is_anim else None,
+                       host         = self._host,
+                       port         = self._port)
+            self._mesh_sent = True
+            print(f"[MeshSender] Mesh sent and ACK'd — "
+                  f"{len(verts)} verts, {len(tris)//3} tris")
         except OSError as e:
             print(f"[MeshSender] ERROR: Connection failed — {e}")
         except Exception as e:
             print(f"[MeshSender] ERROR: {type(e).__name__}: {e}")
+
+        return 1
+
+    def _on_pipeline_end(self, obj, event):
+        """
+        Called by the progress handler's EndEvent when the full pipeline
+        update finishes.  Sends the Update message so UE commits all buffered
+        mesh payloads.  The deferred ACK blocks until UE finishes building.
+        Runs on the pipeline thread — kept fast by delegating the blocking
+        ACK wait to a daemon thread.
+        """
+        if not self._mesh_sent:
+            return
+        self._mesh_sent = False
+
+        host, port = self._host, self._port
+        threading.Thread(
+            target=self._send_update_async,
+            args=(host, port),
+            daemon=True,
+        ).start()
+
+    def _send_update_async(self, host, port):
+        try:
+            print("[MeshSender] Sending Update ...")
+            _send_update(host=host, port=port)
+            print("[MeshSender] Update ACK received — UE committed all meshes")
+        except OSError as e:
+            print(f"[MeshSender] Update ERROR: Connection failed — {e}")
+        except Exception as e:
+            print(f"[MeshSender] Update ERROR: {type(e).__name__}: {e}")
